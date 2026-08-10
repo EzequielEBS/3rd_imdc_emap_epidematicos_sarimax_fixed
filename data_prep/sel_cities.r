@@ -1,12 +1,15 @@
 # sel_cities.r — Optional data-prep step: extract a focal set of cities.
 #
-# Carves out a handful of geocode-level series (one CSV per city) from the
-# already-merged dengue/chikungunya tables, used only for city-level model
-# diagnostics in sarimax/src/model_sel.r (the IMDC state-level submission
-# itself uses processed_data/<disease>/<disease>_<uf>_agg.csv.gz from
-# agg_data_uf.r, not these files). Can be run any time after
-# merge_dengue.r / merge_chikungunya.r.
+# Carves out the selected geocode-level series (one CSV per city) from the
+# already-merged dengue/chikungunya tables. The same climate aliases and
+# historical lag/rolling columns used by the state-level SARIMAX inputs are
+# added here so the city files expose the same candidate-covariate names.
+#
+# The cutoff-specific model step must still rebuild future covariates for each
+# backtest; these are the historical master features only.
+
 library(tidyverse)
+library(runner)
 
 # IBGE geocodes of state-capital/large cities tracked for dengue diagnostics.
 cities_dengue <- c(
@@ -43,6 +46,84 @@ cities_chikungunya <- c(
 
 dengue_merged <- read_csv("processed_data/dengue/dengue_merged.csv.gz")
 chikungunya_merged <- read_csv("processed_data/chikungunya/chikungunya_merged.csv.gz")
+
+# Verify that the hard-coded challenge lists still match the official
+# target_city flags carried by the epidemiological datasets.
+stopifnot(setequal(
+  cities_dengue,
+  dengue_merged %>% filter(target_city) %>% distinct(geocode) %>% pull(geocode)
+))
+
+stopifnot(setequal(
+  cities_chikungunya,
+  chikungunya_merged %>% filter(target_city) %>% distinct(geocode) %>% pull(geocode)
+))
+
+add_city_features <- function(data) {
+  data <- data %>%
+    arrange(geocode, epiweek) %>%
+    group_by(geocode) %>%
+    mutate(
+      cases = casos,
+      temp_min_mean = temp_min,
+      temp_med_mean = temp_med,
+      temp_max_mean = temp_max,
+      precip_min_mean = precip_min,
+      precip_med_mean = precip_med,
+      precip_max_mean = precip_max,
+      pressure_min_mean = pressure_min,
+      pressure_med_mean = pressure_med,
+      pressure_max_mean = pressure_max,
+      rel_humid_min_mean = rel_humid_min,
+      rel_humid_med_mean = rel_humid_med,
+      rel_humid_max_mean = rel_humid_max,
+      thermal_range_mean = thermal_range,
+      rainy_days_mean = rainy_days,
+      pop = population
+    ) %>%
+    ungroup()
+
+  data <- data %>%
+    group_by(geocode) %>%
+    mutate(
+      across(
+        c(temp_min_mean, temp_med_mean, temp_max_mean, precip_min_mean, precip_med_mean, precip_max_mean,
+          pressure_min_mean, pressure_med_mean, pressure_max_mean, rel_humid_min_mean,
+          rel_humid_med_mean, rel_humid_max_mean, thermal_range_mean, rainy_days_mean),
+        list(
+          lag4 = ~ lag(., 4),
+          lag8 = ~ lag(., 8),
+          lag12 = ~ lag(., 12),
+          lag16 = ~ lag(., 16)
+        ),
+        .names = "{col}_{fn}"
+      )
+    ) %>%
+    ungroup()
+
+  data <- data %>%
+    group_by(geocode) %>%
+    mutate(
+      across(
+        c(temp_min_mean, temp_med_mean, temp_max_mean, precip_min_mean, precip_med_mean, precip_max_mean,
+          pressure_min_mean, pressure_med_mean, pressure_max_mean, rel_humid_min_mean,
+          rel_humid_med_mean, rel_humid_max_mean, thermal_range_mean, rainy_days_mean),
+        list(
+          mean_3mo = ~ dplyr::lag(mean_run(., k = 12, na_rm = TRUE)),
+          mean_6mo = ~ dplyr::lag(mean_run(., k = 24, na_rm = TRUE)),
+          mean_9mo = ~ dplyr::lag(mean_run(., k = 36, na_rm = TRUE)),
+          mean_12mo = ~ dplyr::lag(mean_run(., k = 48, na_rm = TRUE))
+        ),
+        .names = "{col}_{fn}"
+      )
+    ) %>%
+    ungroup()
+
+  data
+}
+
+dengue_merged <- add_city_features(dengue_merged)
+chikungunya_merged <- add_city_features(chikungunya_merged)
 
 lapply(cities_dengue, function(city) {
   if (!dir.exists("processed_data/dengue/sel_cities")) {
