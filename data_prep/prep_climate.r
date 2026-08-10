@@ -14,6 +14,23 @@ library(geobr)
 
 climate <- read_csv("raw_data/climate.csv.gz")
 
+# Update rule: keep base-only rows, add update-only rows, and prefer the
+# update version when the same geocode/epiweek exists in both files.
+climate <- rows_upsert(
+  climate,
+  climate_update,
+  by = c("geocode", "epiweek")
+)
+
+forecasting_climate <- read_csv("raw_data/forecasting_climate.csv.gz")
+forecasting_climate_update <- read_csv("raw_data/forecasting_climate_update_2026.csv.gz")
+
+forecasting_climate <- rows_upsert(
+  forecasting_climate,
+  forecasting_climate_update,
+  by = c("geocode", "reference_month", "forecast_months_ahead")
+)
+
 # Download municipality boundaries (2020 IBGE mesh) to get coordinates for
 # every geocode, since the raw climate data has no spatial reference of its
 # own beyond the geocode itself.
@@ -54,7 +71,8 @@ climate_islands <- climate %>%
   filter(geocode %in% island_to_mainland$mainland_geocode) %>%
   left_join(island_to_mainland, by = c("geocode" = "mainland_geocode")) %>%
   mutate(geocode = island_geocode) %>%
-  select(-island_geocode)
+  select(-island_geocode) %>%
+  anti_join(climate %>% select(geocode, epiweek), by = c("geocode", "epiweek"))
 
 climate_full <- bind_rows(climate, climate_islands)
 
@@ -63,3 +81,4 @@ if (!dir.exists("processed_data/climate")) {
 }
 
 write_csv(climate_full, "processed_data/climate/climate.csv.gz")
+write_csv(forecasting_climate, "processed_data/climate/forecasting_climate.csv.gz")

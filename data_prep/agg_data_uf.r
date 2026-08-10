@@ -120,10 +120,10 @@ dengue_uf <- dengue_uf %>%
         pressure_min_mean, pressure_med_mean, pressure_max_mean, rel_humid_min_mean,
         rel_humid_med_mean, rel_humid_max_mean, thermal_range_mean, rainy_days_mean),
       list(
-        lag4 = ~ lag(., 4, default = first(.)),
-        lag8 = ~ lag(., 8, default = first(.)),
-        lag12 = ~ lag(., 12, default = first(.)),
-        lag16 = ~ lag(., 16, default = first(.))
+        lag4 = ~ lag(., 4),
+        lag8 = ~ lag(., 8),
+        lag12 = ~ lag(., 12),
+        lag16 = ~ lag(., 16)
       ),
       .names = "{col}_{fn}"
     )
@@ -139,10 +139,10 @@ chikungunya_uf <- chikungunya_uf %>%
         pressure_min_mean, pressure_med_mean, pressure_max_mean, rel_humid_min_mean,
         rel_humid_med_mean, rel_humid_max_mean, thermal_range_mean, rainy_days_mean),
       list(
-        lag4 = ~ lag(., 4, default = first(.)),
-        lag8 = ~ lag(., 8, default = first(.)),
-        lag12 = ~ lag(., 12, default = first(.)),
-        lag16 = ~ lag(., 16, default = first(.))
+        lag4 = ~ lag(., 4),
+        lag8 = ~ lag(., 8),
+        lag12 = ~ lag(., 12),
+        lag16 = ~ lag(., 16)
       ),
       .names = "{col}_{fn}"
     )
@@ -160,10 +160,10 @@ dengue_uf <- dengue_uf %>%
         rel_humid_med_mean, rel_humid_max_mean, thermal_range_mean, rainy_days_mean),
       list(
         # Calculates the mean of the previous 12 weeks
-        mean_3mo = ~ dplyr::lag(mean_run(., k = 12, na_rm = TRUE), default = first(.)),
-        mean_6mo = ~ dplyr::lag(mean_run(., k = 24, na_rm = TRUE), default = first(.)),
-        mean_9mo = ~ dplyr::lag(mean_run(., k = 36, na_rm = TRUE), default = first(.)),
-        mean_12mo = ~ dplyr::lag(mean_run(., k = 48, na_rm = TRUE), default = first(.))
+        mean_3mo = ~ dplyr::lag(mean_run(., k = 12, na_rm = TRUE)),
+        mean_6mo = ~ dplyr::lag(mean_run(., k = 24, na_rm = TRUE)),
+        mean_9mo = ~ dplyr::lag(mean_run(., k = 36, na_rm = TRUE)),
+        mean_12mo = ~ dplyr::lag(mean_run(., k = 48, na_rm = TRUE))
       ),
       .names = "{col}_{fn}"
     )
@@ -181,10 +181,10 @@ chikungunya_uf <- chikungunya_uf %>%
         rel_humid_med_mean, rel_humid_max_mean, thermal_range_mean, rainy_days_mean),
       list(
         # Calculates the mean of the previous 12 weeks
-        mean_3mo = ~ dplyr::lag(mean_run(., k = 12, na_rm = TRUE), default = first(.)),
-        mean_6mo = ~ dplyr::lag(mean_run(., k = 24, na_rm = TRUE), default = first(.)),
-        mean_9mo = ~ dplyr::lag(mean_run(., k = 36, na_rm = TRUE), default = first(.)),
-        mean_12mo = ~ dplyr::lag(mean_run(., k = 48, na_rm = TRUE), default = first(.))
+        mean_3mo = ~ dplyr::lag(mean_run(., k = 12, na_rm = TRUE)),
+        mean_6mo = ~ dplyr::lag(mean_run(., k = 24, na_rm = TRUE)),
+        mean_9mo = ~ dplyr::lag(mean_run(., k = 36, na_rm = TRUE)),
+        mean_12mo = ~ dplyr::lag(mean_run(., k = 48, na_rm = TRUE))
       ),
       .names = "{col}_{fn}"
     )
@@ -203,6 +203,12 @@ lapply(unique(dengue_uf$uf), function(uf) {
   dengue_uf %>%
     filter(uf == !!uf) %>%
     write_csv(paste0("processed_data/dengue/dengue_", uf, "_agg.csv.gz"))
+})
+
+lapply(unique(chikungunya_uf$uf), function(uf) {
+  if (uf == "ES") {
+    return()  # Skip ES
+  }
   chikungunya_uf %>%
     filter(uf == !!uf) %>%
     write_csv(paste0("processed_data/chikungunya/chikungunya_", uf, "_agg.csv.gz"))
