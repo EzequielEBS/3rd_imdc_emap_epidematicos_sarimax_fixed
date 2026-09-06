@@ -1,12 +1,39 @@
 source("sarimax/src/utils.r")
 
+#' Build a `cases ~ ...` formula, tolerating an empty term list
+#'
+#' `reformulate()` errors ("'termlabels' must be a character vector of length
+#' at least one") when `vars` is empty instead of producing a valid
+#' intercept-only formula. That happens for real: a state/city can have every
+#' local-weather covariate AND every climate index filtered out, leaving no
+#' terms at all. Falls back to `cases ~ 1` in that case so `run_model_selection()`
+#' still fits a plain (covariate-free) SARIMA instead of crashing.
+safe_reformulate <- function(vars, response = "cases") {
+  if (length(vars) == 0) {
+    as.formula(paste(response, "~ 1"))
+  } else {
+    reformulate(vars, response = response)
+  }
+}
+
 #' Run full covariate/order model selection for one state or city
 #'
 #' End-to-end pipeline for a single state (or city) and disease: loads the
 #' aggregated covariate file, filters candidate covariates (low-variance,
-#' weak-correlation), optionally reduces them via fold-consistent PCA
-#' (`pca_all()`) and tests whether ENSO/IOD/PDO add signal beyond the
-#' retained PCs (`filter_redundant_indices()`), builds a set of candidate
+#' weak-correlation), then either (a) collapses each base local-weather
+#' variable's lag/rolling family down to its single best-correlated variant
+#' via `select_best_per_variable()` and builds covariate combinations
+#' (`pca = FALSE`), or (b) applies that same `select_best_per_variable()`
+#' collapse before reducing the resulting one-column-per-variable set via
+#' fold-consistent PCA (`pca_all()`) and testing whether ENSO/IOD/PDO add
+#' signal beyond the retained PCs (`filter_redundant_indices()`)
+#' (`pca = TRUE`, the default). Both branches apply the same collapse step
+#' first so a base variable's own lag/rolling transforms -- which are fixed
+#' transforms of one series, not genuinely distinct series (see
+#' `src/forecast_covariates.r`) -- are never fed into either covariate
+#' combinations or the PCA input matrix as if they were independent
+#' variables; only the single most-predictive variant per base variable
+#' reaches that stage. Then, either way, this builds a set of candidate
 #' formulas, grid-searches SARIMAX (p,d,q)(P,D,Q) orders via
 #' `run_grid_search()` ranked by mean cross-validated `metric` (default WIS),
 #' and writes the best model\'s per-split metrics and the full formula/order
@@ -117,40 +144,71 @@ run_model_selection <- function(
         return(NULL)
       }
       message("Processing state: ", state)
-      file_name <- paste0("processed_data/", disease,"/", disease, "_", state, "_agg.csv.gz")
+      level <- "state"; id <- state
     } else if (!is.null(city)) {
       if (city %in% concluded_cities$city) {
         message("City ", city, " already processed. Skipping.")
         return(NULL)
       }
       message("Processing city: ", city)
-      file_name <- paste0("processed_data/", disease,"/sel_cities/", disease, "_", city, ".csv.gz")
+      level <- "city"; id <- city
     }
   }
-  
-  dengue_state <- read_csv(file_name, show_col_types = FALSE)
+
+  # load_unit_data() (sarimax/src/utils.r) normalizes the state-vs-city
+  # column-name differences (municipality files use "casos" and lack the
+  # "_mean" suffix on weather variables) so everything below -- get_candidates(),
+  # pca_all(), fit_sarimax() via run_grid_search(), reformulate(response="cases") --
+  # sees one consistent schema regardless of level.
+  dengue_state <- load_unit_data(disease = disease, level = level, id = id)
 
   train_ids  <- paste0("train_", 1:4)
   
   candidates <- get_candidates(dengue_state)
-  candidates <- filter_low_variance(
+  # filter_low_variance()/filter_by_correlation() each message() every column
+  # they drop, which -- with up to 9 lag/rolling columns per base variable --
+  # is a lot of noise that doesn't say what actually matters: which
+  # covariates end up driving the model. Silenced here; what's actually used
+  # for PCA (or, when pca = FALSE, for the covariate-combination search) is
+  # printed explicitly below instead, once it's known.
+  candidates <- suppressMessages(filter_low_variance(
     dengue_state[
-      dengue_state[[train_ids[1]]] == 1, 
+      dengue_state[[train_ids[1]]] == 1,
     ],
-    candidates, 
+    candidates,
     threshold = threshold_low_variance
-  )
-  candidates <- filter_by_correlation(
+  ))
+  candidates <- suppressMessages(filter_by_correlation(
     dengue_state[
-      dengue_state[[train_ids[1]]] == 1, 
+      dengue_state[[train_ids[1]]] == 1,
     ],
-    candidates, 
+    candidates,
     min_cor = min_cor
-  )
+  ))
 
   if (pca) {
     non_index_candidates <- candidates[!grepl("enso|iod|pdo", candidates)]
     climate_indices <- intersect(c("enso", "iod", "pdo"), candidates)
+
+    # Collapse each base local-weather variable's lag/rolling family down to
+    # its single best-correlated-with-response variant BEFORE handing
+    # anything to PCA -- exactly the same collapse the `pca = FALSE` branch
+    # below already applies before build_covariate_combinations(). Without
+    # this, a variable that still has several lag/rolling columns surviving
+    # filtering (all fixed transforms of one series, not genuinely distinct
+    # series -- see src/forecast_covariates.r) would contribute that many
+    # near-duplicate, mutually correlated columns to the PCA input matrix,
+    # letting whichever variable happened to retain the most transforms
+    # dominate the leading components rather than each distinct physical
+    # driver contributing roughly one dimension.
+    if (length(non_index_candidates) > 0) {
+      non_index_candidates <- select_best_per_variable(
+        dengue_state[
+          dengue_state[[train_ids[1]]] == 1,
+        ],
+        non_index_candidates
+      )
+    }
 
     if (length(non_index_candidates) == 0) {
       # Variance/correlation filtering dropped every local-weather covariate
@@ -168,12 +226,20 @@ run_model_selection <- function(
       # No PCs to test redundancy against, so keep whatever indices already
       # passed filter_by_correlation() above as-is.
       kept_indices <- climate_indices
-      formulas <- list(reformulate(
-        if (length(kept_indices) > 0) kept_indices else character(0),
-        response = "cases"
-      ))
+      if (length(kept_indices) == 0) {
+        message(
+          "No climate indices survived filtering either for ",
+          if (!is.null(state)) state else city,
+          " — fitting a covariate-free SARIMA."
+        )
+      }
+      formulas <- list(safe_reformulate(kept_indices))
       candidates <- kept_indices
     } else {
+      message(sprintf(
+        "Applying PCA to %d covariate(s): %s",
+        length(non_index_candidates), paste(non_index_candidates, collapse = ", ")
+      ))
       pca_result <- pca_all(
         data = dengue_state,
         candidates = non_index_candidates,
@@ -200,11 +266,11 @@ run_model_selection <- function(
       }
 
       formulas <- lapply(seq_len(max_k), function(i) {
-        reformulate(pcs[1:i], response = "cases")
+        safe_reformulate(pcs[1:i])
       })
       if (length(kept_indices) > 0) {
         formulas <- c(formulas, lapply(seq_len(max_k), function(i) {
-          reformulate(c(pcs[1:i], kept_indices), response = "cases")
+          safe_reformulate(c(pcs[1:i], kept_indices))
         }))
       }
       candidates <- c(pcs, kept_indices)
@@ -212,17 +278,34 @@ run_model_selection <- function(
   } else {
     candidates <- select_best_per_variable(
       dengue_state[
-        dengue_state[[train_ids[1]]] == 1, 
+        dengue_state[[train_ids[1]]] == 1,
       ],
       candidates
-    )  
-    combos <- build_covariate_combinations(
-      data       = dengue_state,
-      covariates = candidates,
-      threshold  = threshold_cor,
-      max_size   = max_size_covariates
     )
-    formulas   <- lapply(combos, \(vars) reformulate(vars, response = "cases"))
+    if (length(candidates) == 0) {
+      # build_covariate_combinations() can't factor a zero-column correlation
+      # matrix (errors "'x' is empty" out of cor()) -- same "everything got
+      # filtered out" situation the pca = TRUE branch handles above, just
+      # reached via the exhaustive-combination path instead of PCA.
+      message(
+        "No covariates survived filtering for ",
+        if (!is.null(state)) state else city,
+        " — fitting a covariate-free SARIMA."
+      )
+      formulas <- list(safe_reformulate(character(0)))
+    } else {
+      message(sprintf(
+        "Building covariate combinations from %d candidate(s): %s",
+        length(candidates), paste(candidates, collapse = ", ")
+      ))
+      combos <- build_covariate_combinations(
+        data       = dengue_state,
+        covariates = candidates,
+        threshold  = threshold_cor,
+        max_size   = max_size_covariates
+      )
+      formulas   <- lapply(combos, \(vars) safe_reformulate(vars))
+    }
   }
   
   if (pca) {
@@ -241,14 +324,37 @@ run_model_selection <- function(
     lambda    = lambda,
     fixed_stat_par = fixed_stat_par,
     bootstrap = bootstrap,
-    npaths    = npaths
+    npaths    = npaths,
+    # Share this unit's covariate forecasts with fit.r/evaluate_covariate_forecasts.r
+    # (and a later re-run of this same function) via the persistent table --
+    # see covariate_forecast_table_path().
+    table_path = covariate_forecast_table_path(disease, level),
+    id         = id
   )
+
+  # If EVERY formula/order combination failed to fit, group_by()...
+  # filter(all(!failed)) below removes every group, and the metric column
+  # (e.g. "wis") never got created at all since compute_metrics() was never
+  # reached for any of them. That used to surface three calls later as a
+  # cryptic "subscript out of bounds" from parse_order() on an empty
+  # best_order -- worse, `get(metric)` can silently resolve to an unrelated
+  # same-named function from an attached package (scoringutils exports a
+  # `wis()` function) instead of erroring "object not found", so the
+  # underlying all-failed condition was easy to miss entirely. Catch it here
+  # instead, right where the actual cause -- and run_grid_search()'s
+  # "Failure reasons:" summary above -- are still in view.
+  if (nrow(order_screen$metrics) == 0 || all(order_screen$metrics$failed)) {
+    stop(sprintf(
+      "run_model_selection(): every formula/order combination failed to fit for %s -- see the 'Failure reasons:' summary printed above by run_grid_search().",
+      if (!is.null(state)) state else city
+    ))
+  }
 
   metric_name <- paste0("mean_", metric)
   best_par <- order_screen$metrics |>
     group_by(formula_id, order) |>
     filter(all(!failed)) |>
-    summarise(mean_metric = mean(get(metric)), .groups = "drop") |>
+    summarise(mean_metric = mean(.data[[metric]]), .groups = "drop") |>
     arrange(mean_metric) |>
     slice(1)
   best_order <- best_par$order
@@ -259,7 +365,7 @@ run_model_selection <- function(
     metrics <- order_screen$metrics |>
       group_by(formula_id, order) |>
       filter(all(!failed)) |>
-      summarise(mean_metric = mean(get(metric)), .groups = "drop") |>
+      summarise(mean_metric = mean(.data[[metric]]), .groups = "drop") |>
       arrange(mean_metric)
     best_pred <- order_screen$predictions |>
       filter(formula_id == best_formula, order == best_order)
@@ -274,12 +380,20 @@ run_model_selection <- function(
       method    = method,
       lambda    = lambda,
       bootstrap = bootstrap,
-      npaths    = npaths
+      npaths    = npaths,
+      table_path = covariate_forecast_table_path(disease, level),
+      id         = id
     )
+    if (nrow(formula_results$metrics) == 0 || all(formula_results$metrics$failed)) {
+      stop(sprintf(
+        "run_model_selection(): every formula failed to fit at the chosen order for %s -- see the 'Failure reasons:' summary printed above by run_grid_search().",
+        if (!is.null(state)) state else city
+      ))
+    }
     metrics <- formula_results$metrics |>
       group_by(formula_id, order) |>
       filter(all(!failed)) |>        # keep only groups where ALL splits succeeded
-      summarise(mean_metric = mean(get(metric)), .groups = "drop") |>
+      summarise(mean_metric = mean(.data[[metric]]), .groups = "drop") |>
       arrange(mean_metric)
 
     best_formula <- metrics$formula_id[1]

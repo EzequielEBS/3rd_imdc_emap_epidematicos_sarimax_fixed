@@ -8,101 +8,363 @@ library(scoringutils)
 library(parallel)
 library(pbapply)
 
-#' Fit a SARIMAX model and return forecasts with prediction intervals
+source("sarimax/src/forecast_covariates.r")
+
+#' Convert a YYYYWW epiweek integer to the Date of its opening Sunday (MMWR)
 #'
-#' @param data        A data frame containing all columns referenced in formula,
-#'                    plus `epiweek`, `cases`, and train/target indicator columns.
-#' @param formula     A formula with `cases` as LHS and covariates as RHS,
-#'                    e.g. ~ temp_med_mean + precip_med_mean + enso
-#' @param train_id    Character string: one of "train_1","train_2","train_3","train_4"
-#' @param quantiles   Numeric vector of coverage levels, e.g. c(0.50, 0.80, 0.95).
-#'                    Each value q produces lower_{q*100} and upper_{q*100} columns.
-#' @param order       ARIMA (p,d,q) order. Default c(1,1,1).
-#' @param seasonal    Seasonal ARIMA list, e.g. list(order=c(1,0,1), period=52).
-#'                    Default list(order=c(1,0,1), period=52) for weekly epiweek data.
+#' Anchors on Jan 4, which is always in MMWR epidemiological week 1.
 #'
-#' @return A tibble with columns: date, pred, lower_*, upper_*
+#' @param yw  Integer (or vector) epiweek in YYYYWW format, e.g. 202541.
+#'
+#' @return Date (or vector of Dates): the Sunday opening that epiweek.
+epiweek_to_date <- function(yw) {
+  yr   <- yw %/% 100L
+  wk   <- yw  %% 100L
+  jan4 <- as.Date(paste0(yr, "-01-04"))
+  dow_jan4  <- as.integer(format(jan4, "%w"))  # %w: 0 = Sunday
+  sunday_w1 <- jan4 - dow_jan4                 # Sunday on or before Jan 4
+  sunday_w1 + (wk - 1L) * 7L
+}
+
+#' Check whether a given year has 53 epiweeks (MMWR/Brazilian calendar)
+#'
+#' Derived from `epiweek_to_date()` for consistency: a year has 53 weeks iff
+#' the Sunday that would open week 53 falls before week 1 of the next year.
+#'
+#' @param year  Integer year (e.g. 2025).
+#'
+#' @return Logical: TRUE if `year` has 53 epiweeks, FALSE if it has 52.
+has_53_weeks <- function(year) {
+  epiweek_to_date(year * 100L + 53L) < epiweek_to_date((year + 1L) * 100L + 1L)
+}
+
+#' Enumerate all epiweeks (inclusive) between two YYYYWW integers
+#'
+#' Correctly rolls over year boundaries and accounts for 52- vs 53-week years
+#' via `has_53_weeks()`.
+#'
+#' @param start  Integer epiweek in YYYYWW format marking the start (inclusive).
+#' @param end    Integer epiweek in YYYYWW format marking the end (inclusive).
+#'
+#' @return Integer vector of YYYYWW epiweeks from `start` to `end`.
+enumerate_epiweeks <- function(start, end) {
+  start_year <- start %/% 100L
+  start_week <- start  %% 100L
+  end_year   <- end   %/% 100L
+  end_week   <- end    %% 100L
+
+  epiweeks <- integer(0)
+  yr <- start_year
+  wk <- start_week
+
+  repeat {
+    epiweeks <- c(epiweeks, yr * 100L + wk)
+    if (yr == end_year && wk == end_week) break
+    n_weeks <- if (has_53_weeks(yr)) 53L else 52L
+    if (wk < n_weeks) {
+      wk <- wk + 1L
+    } else {
+      yr <- yr + 1L
+      wk <- 1L
+    }
+  }
+  epiweeks
+}
+
+#' Load one unit's (state or municipality) processed data file, normalized to
+#' a single canonical column schema
+#'
+#' State-level aggregate files (`processed_data/<disease>/<disease>_<UF>_agg.csv.gz`)
+#' and municipality-level files (`processed_data/<disease>/sel_cities/<disease>_<geocode>.csv.gz`)
+#' come from different upstream pipelines and don't share column names: the
+#' response is `cases` at state level but `casos` (Portuguese) at municipality
+#' level, and municipality weather variables (`temp_min`, `precip_med`, ...)
+#' lack the `_mean` suffix state-level variables carry for the same
+#' already-aggregated quantity (`temp_min_mean`, `precip_med_mean`, ...).
+#' Every other function in this pipeline (`get_candidates()`, `fit_sarimax()`,
+#' `pca_all()`, ...) is written against the state-level names, so rather than
+#' teaching each of them about two schemas, this function normalizes once at
+#' load time: after this, `cases` and the `_mean`-suffixed weather names are
+#' always present regardless of level, and every downstream function stays
+#' completely level-agnostic.
+#'
+#' Note: municipality files carry no lagged (`_lag<k>`) or rolling-window
+#' (`_mean_<k>mo`) covariates at all -- that feature engineering has only
+#' been done at state level upstream -- so `get_candidates()` on
+#' municipality data will only ever return contemporaneous candidates (plus
+#' any of enso/iod/pdo that survive filtering), never lagged/rolling ones.
+#' That's a real difference in available signal, not a bug this function
+#' works around.
+#'
+#' @param disease  "dengue" or "chikungunya".
+#' @param level    "state" or "city".
+#' @param id       Two-letter UF code (level = "state") or IBGE municipality
+#'                 geocode (level = "city").
+#' @param processed_data_dir  Base directory containing the disease
+#'                 subfolders (default "processed_data").
+#'
+#' @return A tibble with canonical column names (`cases`, `epiweek`,
+#'   `train_1..4`/`target_1..4`, `<var>_mean` weather columns, etc.).
+load_unit_data <- function(disease, level = c("state", "city"), id,
+                            processed_data_dir = "processed_data") {
+  level <- match.arg(level)
+
+  file_name <- if (level == "state") {
+    file.path(processed_data_dir, disease, paste0(disease, "_", id, "_agg.csv.gz"))
+  } else {
+    file.path(processed_data_dir, disease, "sel_cities", paste0(disease, "_", id, ".csv.gz"))
+  }
+  if (!file.exists(file_name)) {
+    stop("load_unit_data(): file not found: ", file_name)
+  }
+  data <- read_csv(file_name, show_col_types = FALSE)
+
+  # -- Response column: municipality files use the Portuguese "casos" -------
+  if (!"cases" %in% names(data) && "casos" %in% names(data)) {
+    data <- dplyr::rename(data, cases = casos)
+  }
+
+  # -- Weather variables: municipality files omit the "_mean" suffix that ---
+  #    state-level files use for the same (already-aggregated) quantity.
+  weather_bases <- c("temp_min", "temp_med", "temp_max",
+                      "precip_min", "precip_med", "precip_max",
+                      "pressure_min", "pressure_med", "pressure_max",
+                      "rel_humid_min", "rel_humid_med", "rel_humid_max",
+                      "thermal_range", "rainy_days")
+  for (base in weather_bases) {
+    mean_name <- paste0(base, "_mean")
+    if (base %in% names(data) && !(mean_name %in% names(data))) {
+      names(data)[names(data) == base] <- mean_name
+    }
+  }
+
+  # -- Population: cosmetic alignment only; not a default candidate column --
+  if (!"pop" %in% names(data) && "population" %in% names(data)) {
+    data <- dplyr::rename(data, pop = population)
+  }
+
+  stopifnot(
+    "epiweek" %in% names(data),
+    "cases"   %in% names(data),
+    all(paste0("train_",  1:4) %in% names(data)),
+    all(paste0("target_", 1:4) %in% names(data))
+  )
+
+  data
+}
+
+#' Extract right-hand-side term names from a SARIMAX covariate formula spec
+#'
+#' Accepts the shapes used across this repo: NULL/empty (no covariates), a
+#' `formula` object, or a character string/vector of term names (optionally
+#' "+"-joined, optionally with a leading "~").
+#'
+#' @param formula  NULL, a formula, or a character string/vector.
+#'
+#' @return Character vector of term names (possibly empty).
+parse_rhs_terms <- function(formula) {
+  if (is.null(formula)) return(character(0))
+  if (inherits(formula, "formula")) {
+    return(attr(stats::terms(formula), "term.labels"))
+  }
+  if (is.character(formula)) {
+    if (length(formula) == 0) return(character(0))
+    rhs <- paste(formula, collapse = "+")
+    if (nchar(trimws(rhs)) == 0) return(character(0))
+    fo <- stats::as.formula(paste("~", rhs))
+    return(attr(stats::terms(fo), "term.labels"))
+  }
+  stop("parse_rhs_terms(): formula must be NULL, a formula, or a character string/vector")
+}
+
+#' Fit a SARIMAX model over an explicit epiweek range and forecast forward
+#'
+#' Fits `Arima()` on `data[epiweek >= train_start & epiweek <= train_end, ]`
+#' and forecasts every epiweek in `forecast_start..forecast_end`. Every
+#' regressor the formula uses is itself forecast forward with its own
+#' seasonal time-series model (`forecast_covariates()`,
+#' sarimax/src/forecast_covariates.r), fit only on data through `train_end`
+#' -- never real future values, and never another year's realized value --
+#' so the covariate side of the forecast is exactly as ex-ante as the
+#' case-count model itself (see root README.md, Section 6, "Data Usage
+#' Restriction"). This single function now covers every use in this repo:
+#' the four retrospective validation splits (train_1..train_4) and the real
+#' submission / forecast-phase window alike -- they differ only in which
+#' epiweek range is passed in, not in how the fit or the covariate
+#' forecasting works.
+#'
+#' @param data                A data frame containing `epiweek`, `cases`,
+#'                            and every column referenced in `formula`.
+#' @param formula             NULL, a formula, or a character string/vector
+#'                            of covariate names (RHS only; `cases` is the
+#'                            implicit response) -- see `parse_rhs_terms()`.
+#' @param train_start         Integer YYYYWW: first training epiweek
+#'                            (inclusive).
+#' @param train_end           Integer YYYYWW: last training epiweek
+#'                            (inclusive) -- also the cutoff used to fit
+#'                            each regressor's own forecasting model.
+#' @param forecast_start      Integer YYYYWW: first forecast epiweek
+#'                            (inclusive).
+#' @param forecast_end        Integer YYYYWW: last forecast epiweek
+#'                            (inclusive).
+#' @param method              Estimation method passed to `Arima()`
+#'                            (default "CSS-ML").
+#' @param lambda              Box-Cox lambda; NULL (default) uses
+#'                            log1p/expm1 instead.
+#' @param optim.control       List passed to `Arima()`'s optimizer (default
+#'                            list(maxit = 500)).
+#' @param optim.method        Optimization method passed to `Arima()`
+#'                            (default "BFGS").
+#' @param levels              Numeric vector of prediction-interval coverage
+#'                            levels (default c(50, 80, 90, 95)).
+#' @param order               ARIMA (p,d,q) order (default c(1,1,1)).
+#' @param seasonal            Seasonal ARIMA list, e.g.
+#'                            list(order = c(1,0,1), period = 52).
+#' @param bootstrap           Logical: use bootstrapped simulation paths for
+#'                            prediction intervals instead of Gaussian
+#'                            normal-theory intervals (default TRUE).
+#' @param npaths              Number of bootstrap simulation paths (default
+#'                            1000).
+#' @param covariate_forecasts Optional numeric matrix (forecast horizon rows
+#'                            x regressor columns, named) of already-computed
+#'                            covariate forecasts to use instead of calling
+#'                            `forecast_covariates()` fresh. Meant for hot
+#'                            loops that call this function many times for
+#'                            the same fold with different formulas/orders
+#'                            (see `run_grid_search()`'s per-fold precompute
+#'                            step) -- forecasting each candidate regressor
+#'                            once per fold, rather than once per
+#'                            (formula, order, fold) combination, is what
+#'                            keeps that grid search computationally
+#'                            tractable. Must have >= the columns named in
+#'                            the formula and exactly `forecast_end -
+#'                            forecast_start` (inclusive) rows. NULL
+#'                            (default) computes forecasts on the fly --
+#'                            the right choice for a one-off call, as in
+#'                            sarimax/src/fit.r.
+#' @param table_path          Optional: passed straight through to
+#'                            `forecast_covariates()`'s own `table_path`
+#'                            when `covariate_forecasts` isn't already
+#'                            supplied -- looks each needed root series up
+#'                            in the persistent covariate-forecast table
+#'                            (see `covariate_forecast_table_path()`)
+#'                            first, only fitting live (and saving the
+#'                            result) on a miss. Ignored when
+#'                            `covariate_forecasts` is supplied, since
+#'                            there's nothing left to forecast. Default
+#'                            `NULL` preserves the original always-fit-live
+#'                            behavior exactly.
+#' @param id                  Required when `table_path` is supplied: this
+#'                            unit's id (UF code or municipality geocode).
+#'
+#' @return A tibble with columns `date`, `pred`, and `lower_*`/`upper_*` for
+#'         each level in `levels`, with `warnings` and `fit` attributes
+#'         attached.
 fit_sarimax <- function(data,
-                        formula,
-                        train_id,
-                        method = "CSS-ML",
-                        lambda = NULL,
-                        optim.control = list(maxit = 500),   # more iterations
-                        optim.method  = "BFGS",
-                        levels = c(50, 80, 90, 95),
-                        order      = c(1, 1, 1),
-                        seasonal   = list(order = c(1, 0, 1), period = 52),
-                        bootstrap  = TRUE,   # simulate forecast paths instead of
-                        npaths     = 1000) { # assuming Gaussian normal-theory intervals
+                         formula,
+                         train_start,
+                         train_end,
+                         forecast_start,
+                         forecast_end,
+                         method        = "CSS-ML",
+                         lambda        = NULL,
+                         optim.control = list(maxit = 500),
+                         optim.method  = "BFGS",
+                         levels        = c(50, 80, 90, 95),
+                         order         = c(1, 1, 1),
+                         seasonal      = list(order = c(1, 0, 1), period = 52),
+                         bootstrap     = TRUE,
+                         npaths        = 1000,
+                         covariate_forecasts = NULL,
+                         table_path    = NULL,
+                         id            = NULL) {
 
   stopifnot(is.data.frame(data))
-  stopifnot(train_id %in% paste0("train_", 1:4))
+  stopifnot("epiweek" %in% names(data))
+  stopifnot("cases"   %in% names(data))
 
-  target_id <- sub("train_", "target_", train_id)
-  stopifnot(target_id %in% names(data))
-
-  # ── 1. Split train / target rows ─────────────────────────────────────────
-  train_rows  <- data[data[[train_id]]  == 1, ]
-  target_rows <- data[data[[target_id]] == 1, ]
-
-  if (nrow(train_rows)  == 0) stop("No training rows found for ", train_id)
-  if (nrow(target_rows) == 0) stop("No target rows found for ",  target_id)
-
-  # ── 2. Log-transform response (log1p to handle zero counts) ──────────────
-  if (is.null(lambda)) {
-    y <- log1p(train_rows$cases)
-  } else {
-    y <- train_rows$cases
+  # ── 1. Training rows ────────────────────────────────────────────────────
+  train_rows <- data[data$epiweek >= train_start & data$epiweek <= train_end, ]
+  if (nrow(train_rows) == 0) {
+    stop("No training rows found for epiweeks ", train_start, "-", train_end)
   }
-  
 
-  # ── 3. Build & standardize regressor matrices ─────────────────────────────
-  if (is.null(formula)) {
-    rhs_terms <- character(0)
-  } else if (is.character(formula)) {
-    if (length(formula) == 0) {
-      rhs_terms <- character(0)
-    } else {
-      rhs <- paste(formula, collapse = "+")
-      formula_obj <- stats::as.formula(paste("~", rhs))
-      rhs_terms <- attr(stats::terms(formula_obj), "term.labels")
-    }
-  } else {
-    rhs_terms <- attr(stats::terms(formula), "term.labels")
-  }
+  # ── 2. Enumerate forecast epiweeks & build forecast dates ───────────────
+  fc_epiweeks    <- enumerate_epiweeks(forecast_start, forecast_end)
+  n_fc           <- length(fc_epiweeks)
+  forecast_dates <- epiweek_to_date(fc_epiweeks)  # already Sundays
+
+  # ── 3. Log-transform response (log1p to handle zero counts) ─────────────
+  y <- if (is.null(lambda)) log1p(train_rows$cases) else train_rows$cases
+
+  # ── 4. Build & standardize regressor matrices ───────────────────────────
+  rhs_terms <- parse_rhs_terms(formula)
 
   if (length(rhs_terms) == 0) {
     xreg_train  <- NULL
     xreg_future <- NULL
   } else {
-    raw_train  <- as.matrix(train_rows[,  rhs_terms, drop = FALSE])
-    raw_future <- as.matrix(target_rows[, rhs_terms, drop = FALSE])
+    raw_train <- as.matrix(train_rows[, rhs_terms, drop = FALSE])
 
-    # Compute mean and sd from training data only (no data leakage)
+    # Compute mean/sd from training data only (no data leakage)
     col_means <- colMeans(raw_train, na.rm = TRUE)
     col_sds   <- apply(raw_train, 2, sd, na.rm = TRUE)
-
-    # Avoid division by zero for constant columns
     col_sds[col_sds == 0] <- 1
 
-    xreg_train  <- scale(raw_train,  center = col_means, scale = col_sds)
+    xreg_train <- scale(raw_train, center = col_means, scale = col_sds)
+
+    # Forecast each regressor forward with its own seasonal model, fit only
+    # on train_start..train_end -- unless a precomputed matrix was supplied
+    # (see the @param doc above), in which case just look the columns up.
+    raw_future <- if (!is.null(covariate_forecasts)) {
+      missing_terms <- setdiff(rhs_terms, colnames(covariate_forecasts))
+      if (length(missing_terms) > 0) {
+        stop("fit_sarimax(): covariate_forecasts is missing column(s): ",
+             paste(missing_terms, collapse = ", "))
+      }
+      if (nrow(covariate_forecasts) != n_fc) {
+        stop("fit_sarimax(): covariate_forecasts has ", nrow(covariate_forecasts),
+             " row(s) but the forecast horizon needs ", n_fc)
+      }
+      covariate_forecasts[, rhs_terms, drop = FALSE]
+    } else {
+      forecast_covariates(
+        data        = data,
+        rhs_terms   = rhs_terms,
+        train_start = train_start,
+        train_end   = train_end,
+        h           = n_fc,
+        table_path  = table_path,
+        id          = id
+      )
+    }
     xreg_future <- scale(raw_future, center = col_means, scale = col_sds)
   }
 
-  # ── 4. Fit SARIMAX — capture warnings ─────────────────────────────────────
-  y_ts <- ts(y, frequency = seasonal$period)
+  # ── 5. Fit SARIMAX ───────────────────────────────────────────────────────
+  y_ts         <- ts(y, frequency = seasonal$period)
   fit_warnings <- character(0)
 
+  # NOTE: Arima()/forecast() decide whether xreg was supplied by inspecting
+  # the *unevaluated call expression*, not the argument's value -- passing
+  # `xreg = xreg_train` when xreg_train is NULL still counts as "xreg used"
+  # and later breaks forecast() with "object 'xreg_train' not found" (it
+  # tries to re-evaluate that symbol from a different call frame). Building
+  # the argument list with do.call() and omitting `xreg` entirely when there
+  # are no regressors avoids this.
+  arima_args <- list(
+    y_ts,
+    order         = order,
+    seasonal      = seasonal,
+    method        = method,
+    lambda        = lambda,
+    optim.control = optim.control,
+    optim.method  = optim.method
+  )
+  if (!is.null(xreg_train)) arima_args$xreg <- xreg_train
+
   fit <- withCallingHandlers(
-    Arima(y_ts,
-          order    = order,
-          seasonal = seasonal,
-          xreg     = xreg_train,
-          method   = method,
-          lambda   = lambda,
-          optim.control = optim.control,
-          optim.method  = optim.method
-        ),
+    do.call(Arima, arima_args),
     error = function(e) stop("Arima() failed: ", conditionMessage(e)),
     warning = function(w) {
       fit_warnings <<- c(fit_warnings, conditionMessage(w))
@@ -110,11 +372,20 @@ fit_sarimax <- function(data,
     }
   )
 
-  # ── 5. Detect NaN standard errors ─────────────────────────────────────────
-  nan_se_params <- names(which(is.nan(sqrt(diag(fit$var.coef)))))
+  # ── 6. Detect NaN standard errors ───────────────────────────────────────
+  se_warnings <- character(0)
+  ses <- withCallingHandlers(
+    sqrt(diag(fit$var.coef)),
+    warning = function(w) {
+      se_warnings <<- c(se_warnings, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+  nan_se_params <- names(which(is.nan(ses)))
   if (length(nan_se_params) > 0) {
     fit_warnings <- c(
       fit_warnings,
+      se_warnings,
       paste0(
         "NaN standard errors for: ",
         paste(nan_se_params, collapse = ", "),
@@ -124,60 +395,49 @@ fit_sarimax <- function(data,
     )
   }
 
-  # ── 6. Forecast & back-transform ──────────────────────────────────────────
-  h      <- nrow(target_rows)
-  levels <- sort(unique(levels))
-
+  # ── 7. Forecast & back-transform ─────────────────────────────────────────
+  levels      <- sort(unique(levels))
   fc_warnings <- character(0)
 
+  fc_args <- list(
+    fit,
+    h         = n_fc,
+    level     = levels,
+    bootstrap = bootstrap,
+    npaths    = npaths
+  )
+  if (!is.null(xreg_future)) fc_args$xreg <- xreg_future
+
   fc <- withCallingHandlers(
-    forecast(fit, h = h, xreg = xreg_future, level = levels,
-             bootstrap = bootstrap, npaths = npaths),
+    do.call(forecast::forecast, fc_args),
     warning = function(w) {
       fc_warnings <<- c(fc_warnings, conditionMessage(w))
       invokeRestart("muffleWarning")
     }
   )
 
-  # Back-transform from log1p scale: expm1(x) = exp(x) - 1
-  bt <- expm1  # shorthand
-
-  # ── 7. Access date ─────────────────────────────────────────────
-  dates <- data$date[data[[target_id]] == 1]
+  bt <- if (is.null(lambda)) expm1 else identity
 
   # ── 8. Assemble output tibble ─────────────────────────────────────────────
-  if (is.null(lambda)) {
-    out <- tibble(
-      date = dates,
-      pred = bt(as.numeric(fc$mean))
-    )
-  } else {
-    out <- tibble(
-      date = dates,
-      pred = as.numeric(fc$mean)
-    )
-  }
-  
+  out <- tibble::tibble(
+    date = forecast_dates,
+    pred = bt(as.numeric(fc$mean))
+  )
 
   for (lv in levels) {
     lv_char <- paste0(lv, "%")
-    if (is.null(lambda)) {
-      out[[paste0("lower_", lv)]] <- bt(as.numeric(fc$lower[, lv_char]))
-      out[[paste0("upper_", lv)]] <- bt(as.numeric(fc$upper[, lv_char]))
-    } else {
-      out[[paste0("lower_", lv)]] <- as.numeric(fc$lower[, lv_char])
-      out[[paste0("upper_", lv)]] <- as.numeric(fc$upper[, lv_char])
-    }
+    out[[paste0("lower_", lv)]] <- bt(as.numeric(fc$lower[, lv_char]))
+    out[[paste0("upper_", lv)]] <- bt(as.numeric(fc$upper[, lv_char]))
   }
 
-  # Clip to zero (back-transform should already ensure this, but be safe)
   out <- out |>
-    mutate(across(c(pred, starts_with("lower_"), starts_with("upper_")),
-                  \(x) pmax(x, 0)))
-  
-  # ── 9. Attach warnings as attribute ───────────────────────────────────────
-  all_warnings <- c(fit_warnings, fc_warnings)
+    dplyr::mutate(dplyr::across(
+      c(pred, dplyr::starts_with("lower_"), dplyr::starts_with("upper_")),
+      \(x) pmax(x, 0)
+    ))
 
+  # ── 9. Attach metadata ────────────────────────────────────────────────────
+  all_warnings <- c(fit_warnings, fc_warnings)
   attr(out, "warnings") <- if (length(all_warnings) > 0) all_warnings else NULL
   attr(out, "fit")      <- fit
 
@@ -447,6 +707,18 @@ compute_metrics <- function(
 #'                   component: c(p=2, d=2, q=2, P=1, D=1, Q=1).
 #' @param n_cores    Number of parallel workers for the order loop.
 #'                   Defaults to all available cores minus 1.
+#' @param table_path Optional: passed through to the per-fold
+#'                   `forecast_covariates()` precompute step (see
+#'                   `covariate_forecast_table_path()`) so the fold
+#'                   covariate forecasts this grid search needs are looked
+#'                   up in the persistent table first, and only fit live
+#'                   (then saved) on a miss -- e.g. reusing forecasts a
+#'                   prior `model_sel.r`, `fit.r`, or
+#'                   `evaluate_covariate_forecasts.r` run already computed
+#'                   for this exact unit/fold. Default `NULL` preserves the
+#'                   original always-fit-live behavior exactly.
+#' @param id         Required when `table_path` is supplied: this unit's id
+#'                   (UF code or municipality geocode).
 #'
 #' @return A list with two tibbles:
 #'   $predictions : one row per formula x order x train_id x date
@@ -469,10 +741,18 @@ run_grid_search <- function(data,
                             fixed_stat_par = F,
                             bootstrap = TRUE,
                             npaths    = 1000,
-                            n_cores   = max(1L, detectCores() - 1L)) {
+                            n_cores   = max(1L, detectCores() - 1L),
+                            table_path = NULL,
+                            id         = NULL) {
 
   # ── 1. Build order grid ───────────────────────────────────────────────────
-  if (fixed_order) {
+  # `if (fixed_order)` on a real named order vector (e.g. `c(p=1, d=1, ...)`,
+  # as model_sel.r's pca = FALSE branch passes on its second run_grid_search()
+  # call) is a length-6 condition -- R >= 4.3 makes that a hard error
+  # ("the condition has length > 1"), where older R merely warned and used
+  # the first element. isFALSE() correctly distinguishes "the default FALSE
+  # sentinel" from "a real order vector was passed" regardless of R version.
+  if (!isFALSE(fixed_order)) {
     # Single row grid from fixed order — no filtering needed
     order_grid <- data.frame(
       p = fixed_order["p"], d = fixed_order["d"], q = fixed_order["q"],
@@ -536,14 +816,62 @@ run_grid_search <- function(data,
       stop("Each element of 'formulas' must be a formula or character string/vector")
     }
   })
+  # ── 4b. Precompute covariate forecasts once per fold, not once per grid
+  #        cell. Every formula in `formulas` draws its regressors from the
+  #        same small candidate universe (PCA components / surviving
+  #        ocean-climate indices); forecasting each one once per fold here
+  #        -- instead of once per (formula, order, fold) combination inside
+  #        the parallel loop -- is what keeps genuinely forecasting
+  #        covariates for every validation split computationally tractable.
+  all_rhs_terms <- unique(unlist(lapply(formulas, parse_rhs_terms)))
+
+  fold_windows <- setNames(lapply(train_ids, function(train_id) {
+    target_id <- sub("train_", "target_", train_id)
+    train_ew  <- data$epiweek[data[[train_id]]  == 1]
+    target_ew <- data$epiweek[data[[target_id]] == 1]
+    if (length(train_ew) == 0)  stop("No training rows found for ", train_id)
+    if (length(target_ew) == 0) stop("No target rows found for ", target_id)
+    list(
+      train_start    = min(train_ew),
+      train_end      = max(train_ew),
+      forecast_start = min(target_ew),
+      forecast_end   = max(target_ew)
+    )
+  }), train_ids)
+
+  fold_covariate_forecasts <- if (length(all_rhs_terms) == 0) {
+    setNames(vector("list", length(train_ids)), train_ids)
+  } else {
+    message(sprintf(
+      "Precomputing covariate forecasts for %d candidate regressor(s) x %d fold(s)...",
+      length(all_rhs_terms), length(train_ids)
+    ))
+    setNames(lapply(train_ids, function(train_id) {
+      w <- fold_windows[[train_id]]
+      forecast_covariates(
+        data        = data,
+        rhs_terms   = all_rhs_terms,
+        train_start = w$train_start,
+        train_end   = w$train_end,
+        h           = length(enumerate_epiweeks(w$forecast_start, w$forecast_end)),
+        table_path  = table_path,
+        id          = id
+      )
+    }), train_ids)
+  }
+
   # ── 5. Parallel backend ───────────────────────────────────────────────────
   cl <- makeCluster(n_cores)
   on.exit(stopCluster(cl), add = TRUE)          # no progress_file to unlink
 
   clusterExport(cl, varlist = c(
     "fit_sarimax", "compute_metrics",
+    "enumerate_epiweeks", "epiweek_to_date", "has_53_weeks", "parse_rhs_terms",
+    "forecast_covariates", "forecast_covariate_series", "parse_derived_covariate",
+    ".epiweek_to_date", ".has_53_weeks", ".next_epiweek", ".epiweek_seq_forward",
     "data", "formulas", "formula_ids",
     "order_grid", "job_grid",
+    "fold_windows", "fold_covariate_forecasts",
     "seasonal", "levels", "train_ids",
     "levels", "method", "lambda", "optim.control", "optim.method",
     "bootstrap", "npaths"
@@ -581,31 +909,61 @@ run_grid_search <- function(data,
       split_results <- lapply(train_ids, function(train_id) {
         target_id <- sub("train_", "target_", train_id)
         actual    <- data$cases[data[[target_id]] == 1]
+        w         <- fold_windows[[train_id]]
+
+        # Capture WHY a fit failed, not just THAT it failed -- with every
+        # failure previously collapsed to NULL, a run where every single fit
+        # fails (as opposed to a handful of genuinely bad formula/order
+        # combinations) gave no way to see the underlying Arima()/
+        # compute_metrics() error short of re-running one fit manually
+        # outside the cluster. fail_reason rides along in the fallback rows
+        # below and gets summarized once, after the loop, exactly like
+        # build_covariate_forecast_table.r's "Skip reasons:" summary.
+        fail_reason <- NA_character_
 
         preds <- tryCatch(
           fit_sarimax(data,
-                      formula   = formula,
-                      train_id  = train_id,
-                      levels    = levels,
-                      method    = method,
-                      order     = ord,
-                      seasonal  = sea,
-                      lambda    = lambda,
-                      optim.control = optim.control,
-                      optim.method  = optim.method,
-                      bootstrap = bootstrap,
-                      npaths    = npaths
+                      formula        = formula,
+                      train_start    = w$train_start,
+                      train_end      = w$train_end,
+                      forecast_start = w$forecast_start,
+                      forecast_end   = w$forecast_end,
+                      levels         = levels,
+                      method         = method,
+                      order          = ord,
+                      seasonal       = sea,
+                      lambda         = lambda,
+                      optim.control  = optim.control,
+                      optim.method   = optim.method,
+                      bootstrap      = bootstrap,
+                      npaths         = npaths,
+                      covariate_forecasts = fold_covariate_forecasts[[train_id]]
                     ),
-          error = function(e) NULL
+          error = function(e) {
+            fail_reason <<- conditionMessage(e)
+            NULL
+          }
         )
 
+        if (is.null(preds)) {
+          # fail_reason already set by fit_sarimax()'s own tryCatch above.
+        } else if (nrow(preds) != length(actual)) {
+          fail_reason <- sprintf(
+            "fit_sarimax() returned %d row(s), expected %d (target window mismatch)",
+            nrow(preds), length(actual)
+          )
+        }
         failed  <- is.null(preds) || nrow(preds) != length(actual)
         metrics <- if (!failed) {
           tryCatch(
             as_tibble(compute_metrics(preds, actual)),
-            error = function(e) NULL
+            error = function(e) {
+              fail_reason <<- paste("compute_metrics() failed:", conditionMessage(e))
+              NULL
+            }
           )
         } else NULL
+        failed <- failed || is.null(metrics)
 
         list(
           predictions = if (!failed) {
@@ -615,16 +973,16 @@ run_grid_search <- function(data,
                             failed     = FALSE)
           } else {
             tibble(formula_id = formula_id, order = order_str,
-                  train_id = train_id, failed = TRUE)
+                  train_id = train_id, failed = TRUE, fail_reason = fail_reason)
           },
-          metrics = if (!is.null(metrics)) {
+          metrics = if (!failed) {
             metrics |> mutate(formula_id = formula_id,
                               order      = order_str,
                               train_id   = train_id,
                               failed     = FALSE)
           } else {
             tibble(formula_id = formula_id, order = order_str,
-                  train_id = train_id, failed = TRUE)
+                  train_id = train_id, failed = TRUE, fail_reason = fail_reason)
           }
         )
       })
@@ -652,6 +1010,18 @@ run_grid_search <- function(data,
   message(sprintf("Done. Total time: %s. Failed fits: %d / %d.",
                   fmt_time(elapsed_total), n_failed,
                   total_jobs * length(train_ids)))
+  if (n_failed > 0 && "fail_reason" %in% names(metrics)) {
+    # Printed here rather than left to each job's own message() so the
+    # reasons are visible even though every job ran on a parallel worker
+    # whose message() output is otherwise silently discarded (PSOCK workers'
+    # outfile is /dev/null by default) -- see build_covariate_forecast_
+    # table.r's identical "Skip reasons:" pattern.
+    reason_counts <- sort(table(metrics$fail_reason[metrics$failed]), decreasing = TRUE)
+    message("Failure reasons:")
+    for (r in names(reason_counts)) {
+      message(sprintf("  %d x  %s", reason_counts[[r]], r))
+    }
+  }
 
   list(predictions = predictions, metrics = metrics)
 }

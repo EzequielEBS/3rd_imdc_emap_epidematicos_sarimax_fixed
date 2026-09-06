@@ -1,576 +1,314 @@
-source("sarimax/src/utils.r")
+source("sarimax/src/utils.r")  # also sources forecast_covariates.r
+source("sarimax/src/validate_challenge_rules.r")
 
-#' Convert a YYYYWW epiweek integer to the Date of its opening Sunday (MMWR)
-#'
-#' Anchors on Jan 4, which is always in MMWR epidemiological week 1.
-#'
-#' @param yw  Integer (or vector) epiweek in YYYYWW format, e.g. 202541.
-#'
-#' @return Date (or vector of Dates): the Sunday opening that epiweek.
-# ── Helper: get the Sunday date opening a given YYYYWW epiweek (MMWR) ──────
-# Anchors on Jan 4, which is always in MMWR week 1.
-epiweek_to_date <- function(yw) {
-  yr   <- yw %/% 100L
-  wk   <- yw  %% 100L
-  jan4 <- as.Date(paste0(yr, "-01-04"))
-  dow_jan4  <- as.integer(format(jan4, "%w"))  # %w: 0 = Sunday
-  sunday_w1 <- jan4 - dow_jan4                 # Sunday on or before Jan 4
-  sunday_w1 + (wk - 1L) * 7L
-}
- 
-#' Check whether a given year has 53 epiweeks (MMWR/Brazilian calendar)
-#'
-#' Derived from `epiweek_to_date()` for consistency: a year has 53 weeks iff
-#' the Sunday that would open week 53 falls before week 1 of the next year.
-#'
-#' @param year  Integer year (e.g. 2025).
-#'
-#' @return Logical: TRUE if `year` has 53 epiweeks, FALSE if it has 52.
-# ── Helper: does a given year have 53 epiweeks? (MMWR/Brazilian calendar) ──
-# Derived from epiweek_to_date for consistency: year has 53 weeks iff the
-# Sunday that would open week 53 falls before week 1 of the next year.
-has_53_weeks <- function(year) {
-  epiweek_to_date(year * 100L + 53L) < epiweek_to_date((year + 1L) * 100L + 1L)
-}
+# ── Submission window config ────────────────────────────────────────────────
+# Change ONLY this block to switch which window the train_4/target_4 splits
+# below fit and forecast (they read SUBMISSION_WINDOW, not literal numbers).
+# validate_epiweek_window() aborts immediately -- before any of the long
+# per-unit fitting loops run -- if the resulting bounds don't match what the
+# IMDC rules allow for the chosen phase; see sarimax/src/validate_challenge_rules.r
+# and root README.md, Section 6 ("Data Usage Restriction").
+#
+# Currently set to reproduce Validation Test 4 (2025-2026 season, due July 1).
+# For the Forecast Phase (2026-2027 season, due September 10, after the July 31
+# data update), set instead:
+#   SUBMISSION_PHASE        <- "forecast"
+#   SUBMISSION_TEST_ID       <- NULL
+#   SUBMISSION_FORECAST_YEAR <- 2026
+SUBMISSION_PHASE         <- "validation"
+SUBMISSION_TEST_ID       <- 4
+SUBMISSION_FORECAST_YEAR <- NULL
 
-#' Enumerate all epiweeks (inclusive) between two YYYYWW integers
-#'
-#' Correctly rolls over year boundaries and accounts for 52- vs 53-week years
-#' via `has_53_weeks()`.
-#'
-#' @param start  Integer epiweek in YYYYWW format marking the start (inclusive).
-#' @param end    Integer epiweek in YYYYWW format marking the end (inclusive).
-#'
-#' @return Integer vector of YYYYWW epiweeks from `start` to `end`.
-# ── Helper: enumerate all epiweeks between two YYYYWW integers ─────────────
-enumerate_epiweeks <- function(start, end) {
-  start_year <- start %/% 100L
-  start_week <- start  %% 100L
-  end_year   <- end   %/% 100L
-  end_week   <- end    %% 100L
+SUBMISSION_WINDOW <- expected_challenge_window(
+  phase         = SUBMISSION_PHASE,
+  test_id       = SUBMISSION_TEST_ID,
+  forecast_year = SUBMISSION_FORECAST_YEAR
+)
+validate_epiweek_window(
+  train_start    = SUBMISSION_WINDOW$train_start,
+  train_end      = SUBMISSION_WINDOW$train_end,
+  forecast_start = SUBMISSION_WINDOW$forecast_start,
+  forecast_end   = SUBMISSION_WINDOW$forecast_end,
+  phase          = SUBMISSION_PHASE,
+  test_id        = SUBMISSION_TEST_ID,
+  forecast_year  = SUBMISSION_FORECAST_YEAR
+)
+message(
+  "Submission window: ", SUBMISSION_WINDOW$label, " -- train ",
+  SUBMISSION_WINDOW$train_start, "..", SUBMISSION_WINDOW$train_end,
+  ", forecast ", SUBMISSION_WINDOW$forecast_start, "..", SUBMISSION_WINDOW$forecast_end
+)
 
-  epiweeks <- integer(0)
-  yr <- start_year
-  wk <- start_week
-
-  repeat {
-    epiweeks <- c(epiweeks, yr * 100L + wk)
-    if (yr == end_year && wk == end_week) break
-    n_weeks <- if (has_53_weeks(yr)) 53L else 52L
-    if (wk < n_weeks) {
-      wk <- wk + 1L
-    } else {
-      yr <- yr + 1L
-      wk <- 1L
-    }
-  }
-  epiweeks
+#' Resolve the train/forecast epiweek window for one of the four validation
+#' splits used throughout this file. Split 4 uses SUBMISSION_WINDOW (see the
+#' config block above, since that is the one split whose window changes
+#' depending on which phase this script is currently producing); splits 1-3
+#' are the three already-elapsed retrospective seasons, which always use the
+#' canonical challenge window for their own year regardless of
+#' SUBMISSION_WINDOW.
+#'
+#' @param train_id  One of "train_1", "train_2", "train_3", "train_4".
+#' @param data      The unit/disease data frame (used only to find the
+#'                  earliest epiweek actually present, e.g. chikungunya's
+#'                  later start).
+#'
+#' @return A list with train_start, train_end, forecast_start, forecast_end.
+window_for_train_id <- function(train_id, data) {
+  test_id <- as.integer(sub("train_", "", train_id))
+  if (test_id == 4) return(SUBMISSION_WINDOW)
+  expected_challenge_window("validation", test_id = test_id, data_start = min(data$epiweek))
 }
 
-#' Map an epiweek to the same calendar week one year earlier
-#'
-#' Used to source a seasonal-naive covariate substitute for forecast horizons
-#' where future covariates are not yet observed. If the previous year does
-#' not have a week 53 (i.e. it is a 52-week year), falls back to week 52 of
-#' the previous year — the closest available epiweek.
-#'
-#' @param yw  Integer epiweek in YYYYWW format.
-#'
-#' @return A list with `epiweek` (the previous year\'s YYYYWW epiweek) and
-#'         `adjusted` (logical, TRUE if a week-53 fallback was applied).
-# ── Helper: given YYYYWW, return the previous year's equivalent epiweek ────
-# If the previous year does not have week 53 (52-week year), fall back to
-# week 52 of the previous year — the closest available epiweek.
-prev_year_epiweek <- function(yw) {
-  yr <- yw %/% 100L
-  wk <- yw  %% 100L
-  prev_yr      <- yr - 1L
-  prev_n_weeks <- if (has_53_weeks(prev_yr)) 53L else 52L
- 
-  if (wk <= prev_n_weeks) {
-    list(epiweek = prev_yr * 100L + wk, adjusted = FALSE)
-  } else {
-    # week 53 doesn't exist in prev year → use last week of prev year
-    list(epiweek = prev_yr * 100L + prev_n_weeks, adjusted = TRUE)
-  }
-}
+# ── Candidate covariate selection + PCA, shared by every unit/level/disease ─
+#
+# Identical steps `run_model_selection()` (sarimax/src/model_sel.r) uses to
+# build the covariate space a formula's PCs are drawn from -- kept in sync
+# here so the formula/order picked by model selection resolves to the same
+# regressor columns at final-fit time.
+prepare_unit_covariates <- function(data) {
+  train_rows <- data$train_1 == 1
 
-
-#' Fit a SARIMAX model over an explicit epiweek range and forecast a future epiweek range
-#'
-#' Like `fit_sarimax()`, but splits train/forecast rows by epiweek range
-#' rather than by train_*/target_* indicator columns, and substitutes
-#' unobserved future covariates with the previous year\'s values at the same
-#' epiweek (via `prev_year_epiweek()`) — a seasonal-naive covariate forecast
-#' used because the real future-covariate values are not yet available at
-#' submission time.
-#'
-#' @param data            Data frame with `epiweek`, `cases`, and all
-#'                        covariates referenced in `formula`.
-#' @param formula         Formula or character vector of covariate names
-#'                        (RHS only; `cases` is the implicit response).
-#' @param train_start     Integer YYYYWW: first training epiweek (inclusive).
-#' @param train_end       Integer YYYYWW: last training epiweek (inclusive).
-#' @param forecast_start  Integer YYYYWW: first forecast epiweek (inclusive).
-#' @param forecast_end    Integer YYYYWW: last forecast epiweek (inclusive).
-#' @param method          Estimation method passed to `Arima()` (default
-#'                        "CSS-ML").
-#' @param lambda          Box-Cox lambda; NULL (default) uses log1p/expm1
-#'                        transform instead.
-#' @param optim.control   List passed to `Arima()`\'s optimizer (default
-#'                        list(maxit = 500)).
-#' @param optim.method    Optimization method passed to `Arima()` (default
-#'                        "BFGS").
-#' @param levels          Numeric vector of prediction-interval coverage
-#'                        levels (default c(50, 80, 90, 95)).
-#' @param order           ARIMA (p,d,q) order (default c(1,1,1)).
-#' @param seasonal        Seasonal ARIMA list, e.g.
-#'                        list(order = c(1,0,1), period = 52).
-#' @param bootstrap       Logical: use bootstrapped simulation paths for
-#'                        prediction intervals instead of Gaussian
-#'                        normal-theory intervals (default TRUE).
-#' @param npaths          Number of bootstrap simulation paths (default 1000).
-#'
-#' @return A tibble with columns `date`, `pred`, and `lower_*`/`upper_*` for
-#'         each level in `levels`, with `warnings` and `fit` attributes
-#'         attached (as in `fit_sarimax()`).
-fit_sarimax_epiweek <- function(data,
-                        formula,
-                        train_start,
-                        train_end,
-                        forecast_start,
-                        forecast_end,
-                        method        = "CSS-ML",
-                        lambda        = NULL,
-                        optim.control = list(maxit = 500),
-                        optim.method  = "BFGS",
-                        levels        = c(50, 80, 90, 95),
-                        order         = c(1, 1, 1),
-                        seasonal      = list(order = c(1, 0, 1), period = 52),
-                        bootstrap     = TRUE,
-                        npaths        = 1000) {
-
-  stopifnot(is.data.frame(data))
-  stopifnot("epiweek" %in% names(data))
-  stopifnot("cases"   %in% names(data))
-
-  # ── 1. Training rows ────────────────────────────────────────────────────────
-  train_rows <- data[data$epiweek >= train_start & data$epiweek <= train_end, ]
-  if (nrow(train_rows) == 0) {
-    stop("No training rows found for epiweeks ", train_start, "–", train_end)
-  }
-
-  # ── 2. Enumerate forecast epiweeks & build forecast dates/prev-year info ───
-  fc_epiweeks <- enumerate_epiweeks(forecast_start, forecast_end)
-  n_fc        <- length(fc_epiweeks)
-
-  prev_epiweeks  <- integer(n_fc)
-  forecast_dates <- as.Date(rep(NA, n_fc))
-  adjusted_idx   <- logical(n_fc)
-
-  for (i in seq_len(n_fc)) {
-    res               <- prev_year_epiweek(fc_epiweeks[i])
-    prev_epiweeks[i]  <- res$epiweek
-    adjusted_idx[i]   <- res$adjusted
-    forecast_dates[i] <- epiweek_to_date(fc_epiweeks[i])  # already Sunday
-  }
-
-  if (any(adjusted_idx)) {
-    adj_info <- paste0(
-      fc_epiweeks[adjusted_idx], " (prev: ", prev_epiweeks[adjusted_idx], ")",
-      collapse = "; "
-    )
-    warning(
-      "53-week year mismatch: the following forecast epiweeks have no direct ",
-      "previous-year equivalent and were shifted forward by one week:\n  ",
-      adj_info,
-      call. = FALSE
-    )
-  }
-
-  # ── 3. Log-transform response ───────────────────────────────────────────────
-  y <- if (is.null(lambda)) log1p(train_rows$cases) else train_rows$cases
-
-  # ── 4. Build & standardize regressor matrices ───────────────────────────────
-  rhs_terms <- {
-    if (is.null(formula)) {
-      character(0)
-    } else if (is.character(formula)) {
-      if (length(formula) == 0) character(0)
-      else {
-        fo <- stats::as.formula(paste("~", paste(formula, collapse = "+")))
-        attr(stats::terms(fo), "term.labels")
-      }
-    } else {
-      attr(stats::terms(formula), "term.labels")
-    }
-  }
-
-  if (length(rhs_terms) == 0) {
-    xreg_train  <- NULL
-    xreg_future <- NULL
-  } else {
-    raw_train <- as.matrix(train_rows[, rhs_terms, drop = FALSE])
-
-    col_means <- colMeans(raw_train, na.rm = TRUE)
-    col_sds   <- apply(raw_train, 2, sd, na.rm = TRUE)
-    col_sds[col_sds == 0] <- 1
-
-    xreg_train <- scale(raw_train, center = col_means, scale = col_sds)
-
-    # Look up previous-year rows by epiweek (vectorised, preserving order)
-    prev_rows <- data[match(prev_epiweeks, data$epiweek), rhs_terms, drop = FALSE]
- 
-    if (any(is.na(prev_rows))) {
-      missing_ew <- prev_epiweeks[apply(is.na(prev_rows), 1, any)]
-      stop(
-        "Could not find previous-year covariate data for epiweeks: ",
-        paste(missing_ew, collapse = ", ")
-      )
-    }
- 
-    raw_future  <- as.matrix(prev_rows)
-    xreg_future <- scale(raw_future, center = col_means, scale = col_sds)
-  }
-
-  # ── 5. Fit SARIMAX ──────────────────────────────────────────────────────────
-  y_ts         <- ts(y, frequency = seasonal$period)
-  fit_warnings <- character(0)
-
-  fit <- withCallingHandlers(
-    Arima(y_ts,
-          order    = order,
-          seasonal = seasonal,
-          xreg     = xreg_train,
-          method   = method,
-          lambda   = lambda,
-          optim.control = optim.control,
-          optim.method  = optim.method
-        ),
-    error = function(e) stop("Arima() failed: ", conditionMessage(e)),
-    warning = function(w) {
-      fit_warnings <<- c(fit_warnings, conditionMessage(w))
-      invokeRestart("muffleWarning")
-    }
-  )
-
-  # ── 6. Detect NaN standard errors ──────────────────────────────────────────
-  se_warnings <- character(0)
-  ses <- withCallingHandlers(
-    sqrt(diag(fit$var.coef)),
-    warning = function(w) {
-      se_warnings <<- c(se_warnings, conditionMessage(w))
-      invokeRestart("muffleWarning")
-    }
-  )
-  nan_se_params <- names(which(is.nan(ses)))
-  if (length(nan_se_params) > 0) {
-    fit_warnings <- c(
-      fit_warnings,
-      se_warnings,
-      paste0(
-        "NaN standard errors for: ",
-        paste(nan_se_params, collapse = ", "),
-        ". Prediction intervals may be unreliable. ",
-        "Consider reducing model order or using auto.arima()."
-      )
-    )
-  }
-
-  # ── 7. Forecast & back-transform ────────────────────────────────────────────
-  levels      <- sort(unique(levels))
-  fc_warnings <- character(0)
-
-  fc <- withCallingHandlers(
-    forecast::forecast(
-      fit,
-      h         = n_fc,
-      xreg      = xreg_future,
-      level     = levels,
-      bootstrap = bootstrap,
-      npaths    = npaths
-    ),
-    warning = function(w) {
-      fc_warnings <<- c(fc_warnings, conditionMessage(w))
-      invokeRestart("muffleWarning")
-    }
-  )
-
-  bt <- if (is.null(lambda)) expm1 else identity
-
-  # ── 8. Assemble output tibble ───────────────────────────────────────────────
-  out <- tibble::tibble(
-    date    = forecast_dates,
-    pred    = bt(as.numeric(fc$mean))
-  )
-
-  for (lv in levels) {
-    lv_char <- paste0(lv, "%")
-    out[[paste0("lower_", lv)]] <- bt(as.numeric(fc$lower[, lv_char]))
-    out[[paste0("upper_", lv)]] <- bt(as.numeric(fc$upper[, lv_char]))
-  }
-
-  out <- out |>
-    dplyr::mutate(dplyr::across(
-      c(pred, dplyr::starts_with("lower_"), dplyr::starts_with("upper_")),
-      \(x) pmax(x, 0)
-    ))
-
-  # ── 9. Attach metadata ──────────────────────────────────────────────────────
-  all_warnings <- c(fit_warnings, fc_warnings)
-  attr(out, "warnings") <- if (length(all_warnings) > 0) all_warnings else NULL
-  attr(out, "fit")      <- fit
-
-  out
-}
-
-best_wis_df_dengue_state <- read_csv("sarimax/results/metrics/best_wis_dengue_all_states.csv", show_col_types = FALSE)
-
-preds_dengue_state <- lapply(best_wis_df_dengue_state$state, function(st) {
-  file_name <- paste0("processed_data/dengue/dengue_", st, "_agg.csv.gz")
-  d <- read_csv(file_name, show_col_types = FALSE)
-  train_rows <- d$train_1 == 1
-
-  candidates <- get_candidates(d)
-  candidates <- filter_low_variance(d, candidates, threshold = 0.01)
-  candidates <- filter_by_correlation(
-    d[train_rows, ],
-    candidates,
-    min_cor = 0.1
-  )
-    
+  candidates <- get_candidates(data)
+  candidates <- filter_low_variance(data, candidates, threshold = 0.01)
+  candidates <- filter_by_correlation(data[train_rows, ], candidates, min_cor = 0.1)
 
   pca_result <- pca_all(
-    data = d,
-    candidates = candidates[!grepl("enso|iod|pdo", candidates)],
+    data          = data,
+    candidates    = candidates[!grepl("enso|iod|pdo", candidates)],
     var_threshold = 0.9
   )
-  d <- pca_result$data
+  pca_result$data
+}
 
-  best_order <- best_wis_df_dengue_state |> filter(state == st) |> pull(order)
-  ord <- parse_order(best_order)
-  best_formula <- best_wis_df_dengue_state |> filter(state == st) |> pull(formula_id)
+# ── Fit + forecast every validation split for one unit (state or city) ─────
+#
+# Loads the unit's data, rebuilds its PCA covariate space, then fits the
+# challenge's four train/target splits with the formula/order
+# `run_model_selection()` selected as best for this unit. If that fit
+# produces an actionable warning (a NaN standard error, an internal
+# `auto.arima()` fallback, or an outright fit failure) on any split, it is
+# retried with the next-best formula/order from this unit's full
+# leaderboard (`metrics_all_formulas_<disease>_<id>.csv`), and so on, until
+# a clean fit is found or the leaderboard is exhausted. This generalizes
+# what used to be a chikungunya-only retry loop to every disease and level,
+# since a warning is just as much a reason to prefer a different candidate
+# for dengue (or a municipality) as it is for chikungunya.
+#
+# @param disease      "dengue" or "chikungunya".
+# @param level        "state" or "city".
+# @param id           UF code or municipality geocode.
+# @param best_wis_df  This level's leaderboard-winners table (one row per
+#                      unit), as written by `run_model_selection()` to
+#                      `best_wis_<disease>_all_<states|cities>.csv`.
+# @param unit_col     Name of `best_wis_df`'s unit-identifier column
+#                      ("state" or "city").
+# @param metrics_dir  Directory holding each unit's full formula/order
+#                      leaderboard (default "sarimax/results/metrics").
+# @param preds_dir    Directory predictions are written to (default
+#                      "sarimax/results/preds").
+#
+# Each split's `fit_sarimax()` call passes this unit's persistent
+# covariate-forecast table (`covariate_forecast_table_path()`) so a root
+# series' forecast already computed by `model_sel.r`'s grid search for this
+# exact unit/fold is reused here instead of being re-fit from scratch, and
+# vice versa on a later `model_sel.r` re-run.
+#
+# @return A list: `id`, `resolved` (logical), `used_row` (1 = the top pick
+#   worked untouched), `warnings` (named list by target_id), and `preds` (the
+#   four splits' forecasts, row-bound, with a `target_id` and unit_col
+#   column attached).
+fit_unit_predictions <- function(disease, level, id, best_wis_df, unit_col,
+                                  metrics_dir = "sarimax/results/metrics",
+                                  preds_dir   = "sarimax/results/preds") {
+
+  message(sprintf("[%s | %s | %s] Loading and preparing covariates...", disease, level, id))
+  d <- load_unit_data(disease = disease, level = level, id = id)
+  d <- prepare_unit_covariates(d)
+
+  unit_row <- best_wis_df[best_wis_df[[unit_col]] == id, ]
+  candidate_rows <- tibble(formula_id = unit_row$formula_id, order = unit_row$order)
+
+  metrics_file <- file.path(metrics_dir, paste0("metrics_all_formulas_", disease, "_", id, ".csv"))
+  if (file.exists(metrics_file)) {
+    metrics_df <- read_csv(metrics_file, show_col_types = FALSE)
+    # Rows 2.. are fallback candidates, already ranked by CV score.
+    if (nrow(metrics_df) > 1) {
+      candidate_rows <- bind_rows(candidate_rows, metrics_df[-1, c("formula_id", "order")])
+    }
+  }
+
   train_ids  <- paste0("train_", 1:4)
   target_ids <- paste0("target_", 1:4)
-  pred_target <- lapply(seq_along(train_ids), function(i) {
-    train_id <- train_ids[i]
-    target_id <- target_ids[i]
-    if (train_id == "train_4") {
-      fit <- fit_sarimax_epiweek(
-        data = d,
-        formula = best_formula,
-        train_start = 201001,
-        train_end = 202525,
-        forecast_start = 202541,
-        forecast_end = 202640,
-        order = c(ord$order[1], ord$order[2], ord$order[3]),
-        seasonal = list(order = c(ord$seasonal_order[1], ord$seasonal_order[2], ord$seasonal_order[3]), period = 52)
-      )
-    } else {
-      fit <- fit_sarimax(
-        data = d,
-        formula = best_formula,
-        order = c(ord$order[1], ord$order[2], ord$order[3]),
-        seasonal = list(order = c(ord$seasonal_order[1], ord$seasonal_order[2], ord$seasonal_order[3]), period = 52),
-        train_id = train_id
-      )
-    }
-    write_csv(fit, file.path("sarimax/results/preds/", paste0("pred_dengue_", st, "_", target_id, ".csv")))
-  })
-  names(pred_target) <- target_ids
-  bind_rows(pred_target, .id = "target_id") |>
-    mutate(state = st)
-})
 
-best_wis_df_chikungunya_state <- read_csv("sarimax/results/metrics/best_wis_chikungunya_all_states.csv", show_col_types = FALSE)
-state_warnings_chikungunya <- list()
+  resolved       <- FALSE
+  first_attempt  <- NULL   # kept as the fallback if nothing ever resolves
+  final_preds    <- NULL
+  final_warnings <- list()
+  used_row       <- 1L
 
-preds_chikungunya_state <- lapply(best_wis_df_chikungunya_state$state, function(st) {
-  file_name <- paste0("processed_data/chikungunya/chikungunya_", st, "_agg.csv.gz")
-  d <- read_csv(file_name, show_col_types = FALSE)
-  train_rows <- d$train_1 == 1
-
-  candidates <- get_candidates(d)
-  candidates <- filter_low_variance(d, candidates, threshold = 0.01)
-  candidates <- filter_by_correlation(
-    d[train_rows, ],
-    candidates,
-    min_cor = 0.1
-  )
-    
-
-  pca_result <- pca_all(
-    data = d,
-    candidates = candidates[!grepl("enso|iod|pdo", candidates)],
-    var_threshold = 0.9
-  )
-  d <- pca_result$data
-
-  best_order <- best_wis_df_chikungunya_state |> filter(state == st) |> pull(order)
-  ord <- parse_order(best_order)
-  best_formula <- best_wis_df_chikungunya_state |> filter(state == st) |> pull(formula_id)
-  train_ids  <- paste0("train_", 1:4)
-  target_ids <- paste0("target_", 1:4)
-  pred_target <- lapply(seq_along(train_ids), function(i) {
-    train_id <- train_ids[i]
-    target_id <- target_ids[i]
-    if (train_id == "train_4") {
-      fit <- fit_sarimax_epiweek(
-        data = d,
-        formula = best_formula,
-        train_start = 201001,
-        train_end = 202525,
-        forecast_start = 202541,
-        forecast_end = 202640,
-        order = c(ord$order[1], ord$order[2], ord$order[3]),
-        seasonal = list(order = c(ord$seasonal_order[1], ord$seasonal_order[2], ord$seasonal_order[3]), period = 52),
-        optim.method = "BFGS"
-      )
-    } else {
-      fit <- fit_sarimax(
-        data = d,
-        formula = best_formula,
-        order = c(ord$order[1], ord$order[2], ord$order[3]),
-        seasonal = list(order = c(ord$seasonal_order[1], ord$seasonal_order[2], ord$seasonal_order[3]), period = 52),
-        train_id = train_id
-      )
-    }
-    # ── Report warnings with state/target context ──────────────────────────
-    w <- attr(fit, "warnings")
-    if (!is.null(w)) {
-      state_warnings_chikungunya[[st]] <<- c(state_warnings_chikungunya[[st]],
-        setNames(w, rep(target_id, length(w))))
-      message(sprintf("[%s | %s] %d warning(s):\n%s",
-                      st, target_id, length(w),
-                      paste0("  - ", w, collapse = "\n")))
-    }
-    write_csv(fit, file.path("sarimax/results/preds/", paste0("pred_chikungunya_", st, "_", target_id, ".csv")))
-    fit
-  })
-  names(pred_target) <- target_ids
-  bind_rows(pred_target, .id = "target_id") |>
-    mutate(state = st)
-})
-
-states_to_retry_chikungunya <- names(state_warnings_chikungunya)
-# states_to_retry_chikungunya <- c("DF", "MS", "RO", "SP")
-state_warnings_chikungunya <- list()
-preds_chikungunya_retry    <- list()
-resolved_formulas_chikungunya <- tibble(state = character(), formula_id = character(), order = character(), row = integer())
-
-for (st in states_to_retry_chikungunya) {
-  file_name <- paste0("processed_data/chikungunya/chikungunya_", st, "_agg.csv.gz")
-  d <- read_csv(file_name, show_col_types = FALSE)
-  train_rows <- d$train_1 == 1
-
-  candidates <- get_candidates(d)
-  candidates <- filter_low_variance(d, candidates, threshold = 0.01)
-  candidates <- filter_by_correlation(
-    d[train_rows, ],
-    candidates,
-    min_cor = 0.1
-  )
-
-  pca_result <- pca_all(
-    data       = d,
-    candidates = candidates[!grepl("enso|iod|pdo", candidates)],
-    var_threshold = 0.9
-  )
-  d <- pca_result$data
-
-  metrics_file <- paste0("sarimax/results/metrics/metrics_all_formulas_chikungunya_", st, ".csv")
-  metrics_df   <- read_csv(metrics_file, show_col_types = FALSE)
-
-  i          <- 2
-  resolved   <- FALSE
-
-  while (i <= nrow(metrics_df) && !resolved) {
-    message(sprintf("[%s] Trying formula row %d of %d: %s",
-                    st, i, nrow(metrics_df), metrics_df$formula_id[i]))
-
-    best_order   <- metrics_df$order[i]
+  for (row_i in seq_len(nrow(candidate_rows))) {
+    best_formula <- candidate_rows$formula_id[row_i]
+    best_order   <- candidate_rows$order[row_i]
     ord          <- parse_order(best_order)
-    best_formula <- metrics_df$formula_id[i]
-    train_ids    <- paste0("train_", 1:4)
-    target_ids   <- paste0("target_", 1:4)
 
-    # Reset warnings for this attempt
+    if (row_i > 1) {
+      message(sprintf("[%s] Trying formula row %d of %d: %s",
+                      id, row_i, nrow(candidate_rows), best_formula))
+    }
+
     attempt_warnings <- list()
+    attempt_failed   <- FALSE
 
     pred_target <- lapply(seq_along(train_ids), function(j) {
-      train_id  <- train_ids[j]
       target_id <- target_ids[j]
-
-      if (train_id == "train_4") {
-        fit <- fit_sarimax_epiweek(
+      win <- window_for_train_id(train_ids[j], d)
+      fit <- tryCatch(
+        fit_sarimax(
           data           = d,
           formula        = best_formula,
-          train_start    = 201001,
-          train_end      = 202525,
-          forecast_start = 202541,
-          forecast_end   = 202640,
+          train_start    = win$train_start,
+          train_end      = win$train_end,
+          forecast_start = win$forecast_start,
+          forecast_end   = win$forecast_end,
           order          = c(ord$order[1], ord$order[2], ord$order[3]),
           seasonal       = list(order = c(ord$seasonal_order[1], ord$seasonal_order[2], ord$seasonal_order[3]), period = 52),
-          optim.method   = "BFGS"
-        )
-      } else {
-        fit <- fit_sarimax(
-          data     = d,
-          formula  = best_formula,
-          order    = c(ord$order[1], ord$order[2], ord$order[3]),
-          seasonal = list(order = c(ord$seasonal_order[1], ord$seasonal_order[2], ord$seasonal_order[3]), period = 52),
-          train_id = train_id
-        )
-      }
+          optim.method   = "BFGS",
+          # Reuse whatever root-covariate forecasts model_sel.r (or an
+          # earlier fit.r/evaluate_covariate_forecasts.r run) already
+          # computed for this exact unit/fold, instead of re-fitting
+          # tbats/stlf/Arima from scratch -- see covariate_forecast_table_path().
+          table_path     = covariate_forecast_table_path(disease, level),
+          id             = id
+        ),
+        error = function(e) {
+          attempt_failed <<- TRUE
+          message(sprintf("[%s | %s] fit_sarimax() failed: %s", id, target_id, conditionMessage(e)))
+          NULL
+        }
+      )
+      if (is.null(fit)) return(NULL)
 
       w <- attr(fit, "warnings")
       if (!is.null(w)) {
         attempt_warnings[[target_id]] <<- w
         message(sprintf("[%s | %s] %d warning(s):\n%s",
-                        st, target_id, length(w),
-                        paste0("  - ", w, collapse = "\n")))
+                        id, target_id, length(w), paste0("  - ", w, collapse = "\n")))
       }
-
       fit
     })
     names(pred_target) <- target_ids
 
-    # Check if this attempt is clean (no actionable warnings)
-    actionable <- unlist(lapply(attempt_warnings, function(w) {
+    if (row_i == 1) first_attempt <- list(preds = pred_target, warnings = attempt_warnings)
+
+    actionable <- attempt_failed || any(unlist(lapply(attempt_warnings, function(w) {
       any(grepl("auto.arima|unreliable|failed", w, ignore.case = TRUE))
-    }))
+    })))
 
-    if (length(actionable) == 0 || !any(actionable)) {
-      # Clean fit — save results and move on
-      resolved <- TRUE
-      state_warnings_chikungunya[[st]] <- attempt_warnings
-
-      for (j in seq_along(train_ids)) {
-        write_csv(
-          pred_target[[j]],
-          file.path("sarimax/results/preds/",
-                    paste0("pred_chikungunya_", st, "_", target_ids[j], ".csv"))
-        )
-      }
-
-      preds_chikungunya_retry[[st]] <- bind_rows(pred_target, .id = "target_id") |>
-        mutate(state = st)
-
-      message(sprintf("[%s] Resolved with formula row %d: %s", st, i, best_formula))
-      resolved_formulas_chikungunya <- resolved_formulas_chikungunya |>
-        bind_rows(tibble(state = st, formula_id = best_formula, order = best_order, row = i))
-    } else {
-      message(sprintf("[%s] Formula row %d still has warnings; trying next.", st, i))
+    if (!actionable) {
+      resolved       <- TRUE
+      used_row       <- row_i
+      final_preds    <- pred_target
+      final_warnings <- attempt_warnings
+      if (row_i > 1) message(sprintf("[%s] Resolved with formula row %d: %s", id, row_i, best_formula))
+      break
     }
-
-    i <- i + 1
+    message(sprintf("[%s] Formula row %d still has warnings; trying next.", id, row_i))
   }
 
   if (!resolved) {
-    message(sprintf("[%s] All %d formulas exhausted; could not resolve warnings.", st, nrow(metrics_df)))
-    state_warnings_chikungunya[[st]] <- attempt_warnings
+    message(sprintf(
+      "[%s] All %d formula(s) exhausted; could not resolve warnings. Keeping the top-pick's forecast.",
+      id, nrow(candidate_rows)
+    ))
+    final_preds    <- first_attempt$preds
+    final_warnings <- first_attempt$warnings
   }
+
+  for (j in seq_along(target_ids)) {
+    if (is.null(final_preds[[j]])) {
+      message(sprintf("[%s | %s] No forecast produced -- skipping this target's CSV.", id, target_ids[j]))
+      next
+    }
+    write_csv(
+      final_preds[[j]],
+      file.path(preds_dir, paste0("pred_", disease, "_", id, "_", target_ids[j], ".csv"))
+    )
+  }
+
+  list(
+    id          = id,
+    resolved    = resolved,
+    used_row    = used_row,
+    used_formula = candidate_rows$formula_id[used_row],
+    used_order   = candidate_rows$order[used_row],
+    warnings    = final_warnings,
+    preds       = bind_rows(final_preds, .id = "target_id") |> mutate(!!unit_col := id)
+  )
 }
 
-write_csv(resolved_formulas_chikungunya, "sarimax/results/metrics/resolved_formulas_chikungunya.csv")
-  
+# ── Run every unit in one (disease, level)'s leaderboard ────────────────────
+#
+# Skips gracefully (with a message) if `run_model_selection()` hasn't been
+# run yet for this level -- e.g. today, only the state-level leaderboards
+# exist, so the city-level calls below are no-ops until model_sel.r has been
+# run for cities too.
+run_all_units <- function(disease, level) {
+  unit_col <- if (level == "state") "state" else "city"
+  best_wis_path <- file.path(
+    "sarimax/results/metrics",
+    paste0("best_wis_", disease, "_all_", if (level == "state") "states" else "cities", ".csv")
+  )
+  if (!file.exists(best_wis_path)) {
+    message(sprintf(
+      "[%s | %s] %s not found -- skipping (run model_sel.r for this disease/level first).",
+      disease, level, best_wis_path
+    ))
+    return(invisible(NULL))
+  }
+
+  best_wis_df <- read_csv(best_wis_path, show_col_types = FALSE)
+  ids <- best_wis_df[[unit_col]]
+
+  results <- lapply(ids, function(id) {
+    fit_unit_predictions(
+      disease     = disease,
+      level       = level,
+      id          = id,
+      best_wis_df = best_wis_df,
+      unit_col    = unit_col
+    )
+  })
+  names(results) <- ids
+
+  resolved_formulas <- lapply(results, function(r) {
+    if (r$used_row > 1) {
+      tibble(id = r$id, formula_id = r$used_formula, order = r$used_order, row = r$used_row) |>
+        rename(!!unit_col := id)
+    } else {
+      NULL
+    }
+  }) |> bind_rows()
+
+  if (nrow(resolved_formulas) > 0) {
+    write_csv(
+      resolved_formulas,
+      file.path("sarimax/results/metrics", paste0("resolved_formulas_", disease, "_", level, ".csv"))
+    )
+  }
+
+  unresolved <- vapply(results, function(r) !r$resolved, logical(1))
+  if (any(unresolved)) {
+    message(sprintf(
+      "[%s | %s] %d unit(s) never fully resolved warnings; kept their top-pick forecast: %s",
+      disease, level, sum(unresolved), paste(ids[unresolved], collapse = ", ")
+    ))
+  }
+
+  bind_rows(lapply(results, `[[`, "preds"))
+}
+
+# ── Run every disease x level combination ───────────────────────────────────
+preds_dengue_state      <- run_all_units("dengue",      "state")
+preds_chikungunya_state <- run_all_units("chikungunya", "state")
+preds_dengue_city       <- run_all_units("dengue",      "city")
+preds_chikungunya_city  <- run_all_units("chikungunya", "city")
