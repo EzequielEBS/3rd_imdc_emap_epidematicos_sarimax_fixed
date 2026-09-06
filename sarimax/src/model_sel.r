@@ -459,7 +459,7 @@ results_state_dengue <- lapply(states, function(st) {
 # get summary
 best_wis_df_dengue <- lapply(states, function(st) {
   file_name <- paste0("sarimax/results/metrics/metrics_all_formulas_dengue_", st, ".csv")
-  data <- read_csv(file_name, show_col_types = FALSE)
+  data <- read_leaderboard_csv(file_name)
   data[1, ] |> mutate(state = st, .before = 1)
 }) |> bind_rows()
 write_csv(best_wis_df_dengue, "sarimax/results/metrics/best_wis_dengue_all_states.csv")
@@ -481,7 +481,7 @@ results_state_chikungunya <- lapply(states, function(st) {
 
 best_wis_df_chikungunya <- lapply(states, function(st) {
   file_name <- paste0("sarimax/results/metrics/metrics_all_formulas_chikungunya_", st, ".csv")
-  data <- read_csv(file_name, show_col_types = FALSE)
+  data <- read_leaderboard_csv(file_name)
   data[1, ] |> mutate(state = st, .before = 1)
 }) |> bind_rows()
 write_csv(best_wis_df_chikungunya, "sarimax/results/metrics/best_wis_chikungunya_all_states.csv")
@@ -536,7 +536,7 @@ results_city_dengue <- lapply(cities_dengue, function(city) {
 
 best_wis_df_dengue_cities <- lapply(cities_dengue, function(city) {
   file_name <- paste0("sarimax/results/metrics/metrics_all_formulas_dengue_", city, ".csv")
-  data <- read_csv(file_name, show_col_types = FALSE)
+  data <- read_leaderboard_csv(file_name)
   data[1, ] |> mutate(city = city, .before = 1)
 }) |> bind_rows()
 write_csv(best_wis_df_dengue_cities, "sarimax/results/metrics/best_wis_dengue_all_cities.csv")
@@ -558,7 +558,7 @@ results_city_chikungunya <- lapply(cities_chikungunya, function(city) {
 
 best_wis_df_chikungunya_cities <- lapply(cities_chikungunya, function(city) {
   file_name <- paste0("sarimax/results/metrics/metrics_all_formulas_chikungunya_", city, ".csv")
-  data <- read_csv(file_name, show_col_types = FALSE)
+  data <- read_leaderboard_csv(file_name)
   data[1, ] |> mutate(city = city, .before = 1)
 }) |> bind_rows()
 write_csv(best_wis_df_chikungunya_cities, "sarimax/results/metrics/best_wis_chikungunya_all_cities.csv")

@@ -177,6 +177,39 @@ parse_rhs_terms <- function(formula) {
   stop("parse_rhs_terms(): formula must be NULL, a formula, or a character string/vector")
 }
 
+#' Read a leaderboard/metrics CSV (`best_wis_*.csv`, `metrics_all_formulas_*.csv`)
+#' with `formula_id` always forced to character
+#'
+#' `formula_id` can legitimately be a bare numeral string like `"1"` (an
+#' intercept-only formula -- see `safe_reformulate()`/`run_grid_search()`'s
+#' `formula_ids` computation, used when every candidate covariate got
+#' filtered out for a unit). `readr::read_csv()` guesses column types from
+#' the values actually present: a unit whose only candidate formula is `"1"`
+#' has that same value in every row of its own `metrics_all_formulas_...csv`,
+#' so read in isolation the column looks purely numeric and gets parsed as
+#' numeric (or, for the older all-blank-string bug this was written to
+#' route around, logical `NA`) instead of character -- silently breaking
+#' every downstream consumer that expects `formula_id` to be a
+#' formula-describing string (`parse_rhs_terms()`, `fit_sarimax()`, the
+#' `metrics_df$formula_id`/`unit_row$formula_id` comparisons in
+#' `model_sel.r` and `fit.r`). Forcing the column to character here makes
+#' every reader of these files immune to that, regardless of what a
+#' particular unit's `formula_id` values happen to look like, or whether
+#' the file is read alone or `bind_rows()`-combined with other units' files
+#' whose formulas look more obviously textual.
+#'
+#' @param path  Path to the CSV file.
+#'
+#' @return A tibble, exactly as `readr::read_csv()` would return, except
+#'   `formula_id` (if present) is always character.
+read_leaderboard_csv <- function(path) {
+  read_csv(
+    path,
+    col_types = cols(formula_id = col_character(), .default = col_guess()),
+    show_col_types = FALSE
+  )
+}
+
 #' Fit a SARIMAX model over an explicit epiweek range and forecast forward
 #'
 #' Fits `Arima()` on `data[epiweek >= train_start & epiweek <= train_end, ]`
@@ -811,7 +844,25 @@ run_grid_search <- function(data,
         }
       }
     } else if (inherits(f, "formula")) {
-      paste(attr(stats::terms(f), "term.labels"), collapse = "+")
+      term_labels <- attr(stats::terms(f), "term.labels")
+      # An intercept-only formula (e.g. safe_reformulate(character(0)) ->
+      # `cases ~ 1`, when every candidate covariate got filtered out) has
+      # NO term.labels at all -- "1" isn't a labeled term, it's the
+      # intercept -- so paste(character(0), collapse="+") would silently
+      # produce "". That empty string round-trips through write_csv()/
+      # read_csv() as NA (a column that's blank in every row is type-
+      # guessed as logical), and a later fit.r run then tries to build a
+      # model formula from a literal NA and crashes ("invalid model
+      # formula in ExtractVars") instead of correctly refitting the
+      # covariate-free model this formula actually represents. "1" round-
+      # trips safely (paired with read_leaderboard_csv() above, which
+      # forces formula_id to stay character even when every value in a
+      # unit's column happens to look numeric) and is already handled
+      # correctly on the way back in (parse_rhs_terms("1") -> character(0),
+      # same as the empty-formula case above), matching how the
+      # character-string branch above already represents an intercept-only
+      # spec.
+      if (length(term_labels) == 0) "1" else paste(term_labels, collapse = "+")
     } else {
       stop("Each element of 'formulas' must be a formula or character string/vector")
     }
