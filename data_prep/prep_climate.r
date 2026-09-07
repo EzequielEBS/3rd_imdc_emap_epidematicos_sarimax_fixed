@@ -3,16 +3,46 @@
 # Gap-fills climate data for island municipalities that have no weather
 # station / climate-grid coverage of their own, by copying the climate
 # series of their nearest mainland municipality (with data) under the
-# island's own geocode. Reads raw_data/climate.csv.gz and writes the
-# completed table to processed_data/climate/climate.csv.gz, which is then
-# consumed by data_prep/merge_dengue.r and data_prep/merge_chikungunya.r.
+# island's own geocode. Reads raw_data/climate.csv.gz -- combined with
+# raw_data/climate_update_2026.csv.gz when that incremental file is present
+# (see merge_raw_update(), below) -- and writes the completed table to
+# processed_data/climate/climate.csv.gz, which is then consumed by
+# data_prep/merge_dengue.r and data_prep/merge_chikungunya.r.
 #
 # Run before merge_dengue.r / merge_chikungunya.r.
 library(tidyverse)
 library(sf)
 library(geobr)
 
+#' Combine a base raw-data extract with an incremental "_update" file
+#'
+#' Update rows take precedence over base rows sharing the same key -- the
+#' update is treated as Infodengue/Mosqlimate's revised/consolidated data
+#' for the weeks it covers -- and any (key) combinations present only in
+#' the update file are appended. If no update file exists at `update_path`,
+#' `base` is returned completely unchanged, so this script keeps working
+#' exactly as before once an update is no longer being supplied.
+#'
+#' @param base Data frame already read from the base raw file.
+#' @param update_path Path to the corresponding "_update_2026" file.
+#' @param key_cols Character vector of columns identifying a unique row
+#'   (e.g. c("geocode", "epiweek")).
+#' @return `base` with any updated/new rows from `update_path` merged in.
+merge_raw_update <- function(base, update_path, key_cols) {
+  if (!file.exists(update_path)) {
+    return(base)
+  }
+  update <- read_csv(update_path)
+  # Some raw update extracts carry a stray unnamed index column (e.g. from
+  # write.csv(row.names = TRUE) upstream); drop it so bind_rows() doesn't
+  # pick up an extra, all-but-useless column.
+  update <- update %>% select(-any_of(c("...1", "")))
+  base_kept <- base %>% anti_join(update, by = key_cols)
+  bind_rows(base_kept, update)
+}
+
 climate <- read_csv("raw_data/climate.csv.gz")
+climate <- merge_raw_update(climate, "raw_data/climate_update_2026.csv.gz", c("geocode", "epiweek"))
 
 # Download municipality boundaries (2020 IBGE mesh) to get coordinates for
 # every geocode, since the raw climate data has no spatial reference of its

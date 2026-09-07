@@ -293,6 +293,55 @@ read_leaderboard_csv <- function(path) {
 #' @return A tibble with columns `date`, `pred`, and `lower_*`/`upper_*` for
 #'         each level in `levels`, with `warnings` and `fit` attributes
 #'         attached.
+
+#' Enforce that a point forecast sits inside its own prediction intervals,
+#' and that intervals nest properly from narrowest to widest
+#'
+#' `forecast::forecast(..., bootstrap = TRUE)` computes `mean` via the
+#' model's analytic recursive point forecast, but derives `lower`/`upper`
+#' from simulated bootstrap sample paths -- two different mechanisms that
+#' aren't guaranteed to agree, especially for a narrow level (e.g. 50%) on
+#' a low-signal/skewed series (sparse counts, no surviving covariates).
+#' When they disagree, `pred` can end up outside its own interval, or a
+#' narrower interval can end up wider than a nominally broader one --
+#' either of which the Mosqlimate submission API rejects outright
+#' ("Prediction bounds are not in the correct order"). This widens (never
+#' narrows) bounds, from the narrowest level outward, just enough to
+#' restore lower_<lv1> <= ... <= lower_<lvN> <= pred <= upper_<lvN> <= ...
+#' <= upper_<lv1> for every row. Already-correct forecasts are returned
+#' unchanged.
+#'
+#' @param out A tibble with a `pred` column and `lower_<lv>`/`upper_<lv>`
+#'   columns for each level in `levels`.
+#' @param levels Numeric vector of confidence levels present in `out`
+#'   (e.g. c(50, 80, 90, 95)); need not be sorted.
+#' @return `out` with every lower_*/upper_* column widened as needed.
+enforce_interval_nesting <- function(out, levels) {
+  sorted_levels <- sort(unique(levels))
+
+  # Every interval must contain pred.
+  for (lv in sorted_levels) {
+    lo <- paste0("lower_", lv)
+    hi <- paste0("upper_", lv)
+    out[[lo]] <- pmin(out[[lo]], out$pred)
+    out[[hi]] <- pmax(out[[hi]], out$pred)
+  }
+
+  # Each wider level must contain the next-narrower one.
+  if (length(sorted_levels) > 1) {
+    for (i in 2:length(sorted_levels)) {
+      lo_inner <- paste0("lower_", sorted_levels[i - 1])
+      lo_outer <- paste0("lower_", sorted_levels[i])
+      hi_inner <- paste0("upper_", sorted_levels[i - 1])
+      hi_outer <- paste0("upper_", sorted_levels[i])
+      out[[lo_outer]] <- pmin(out[[lo_outer]], out[[lo_inner]])
+      out[[hi_outer]] <- pmax(out[[hi_outer]], out[[hi_inner]])
+    }
+  }
+
+  out
+}
+
 fit_sarimax <- function(data,
                          formula,
                          train_start,
@@ -462,6 +511,19 @@ fit_sarimax <- function(data,
     out[[paste0("lower_", lv)]] <- bt(as.numeric(fc$lower[, lv_char]))
     out[[paste0("upper_", lv)]] <- bt(as.numeric(fc$upper[, lv_char]))
   }
+
+  # forecast()'s `mean` (the analytic recursive point forecast) and its
+  # `lower`/`upper` (empirical quantiles of simulated bootstrap paths, since
+  # bootstrap = TRUE by default) come from two different mechanisms and
+  # aren't guaranteed to agree -- for a low-signal/skewed series (sparse
+  # counts, no surviving covariates) `pred` can end up outside its own
+  # interval, especially the narrowest one. Since bt() is a monotonic
+  # transform this can't be introduced by back-transformation itself; it
+  # comes from forecast() directly. Widen (never narrow) bounds so every
+  # interval contains `pred` and nests properly, or Mosqlimate's submission
+  # API rejects the row outright ("Prediction bounds are not in the correct
+  # order").
+  out <- enforce_interval_nesting(out, levels)
 
   out <- out |>
     dplyr::mutate(dplyr::across(

@@ -365,10 +365,10 @@ repository <- "EzequielEBS/3rd_imdc_emap_epidematicos_sarimax_fixed"
 submit_mosqlimate_forecasts(
   disease       = "A90",
   disease_label = "dengue",
-  commit        = "45830c1e76b9645aef7a011e4cf2f7d0fe6c02dd",
+  commit        = "91ef2aa76ae3b2b4ebdafbe08a5830c5be992083",
   repository    = repository,
   level         = "state",
-  on_duplicate  = "skip",
+  on_duplicate  = "overwrite",
   target        = "validation"
 )
 
@@ -376,7 +376,7 @@ submit_mosqlimate_forecasts(
 submit_mosqlimate_forecasts(
   disease       = "A90",
   disease_label = "dengue",
-  commit        = "372294033bf4aa2586eb4d770ef75acf7dec21a3",
+  commit        = "91ef2aa76ae3b2b4ebdafbe08a5830c5be992083",
   repository    = repository,
   level         = "city",
   on_duplicate  = "skip",
@@ -387,7 +387,7 @@ submit_mosqlimate_forecasts(
 submit_mosqlimate_forecasts(
   disease       = "A92.0",
   disease_label = "chikungunya",
-  commit        = "ec240514fbcdffa0bfdaadcdc65c056e6a80aff8",
+  commit        = "91ef2aa76ae3b2b4ebdafbe08a5830c5be992083",
   repository    = repository,
   level         = "state",
   on_duplicate  = "skip",
@@ -398,7 +398,7 @@ submit_mosqlimate_forecasts(
 submit_mosqlimate_forecasts(
   disease       = "A92.0",
   disease_label = "chikungunya",
-  commit        = "ec240514fbcdffa0bfdaadcdc65c056e6a80aff8",
+  commit        = "91ef2aa76ae3b2b4ebdafbe08a5830c5be992083",
   repository    = repository,
   level         = "city",
   on_duplicate  = "skip",
@@ -422,3 +422,4 @@ submit_mosqlimate_forecasts(
   target        = "forecast",
   on_duplicate  = "skip"
 )
+
