@@ -416,10 +416,39 @@ submit_mosqlimate_forecasts(
 submit_mosqlimate_forecasts(
   disease       = "A90",
   disease_label = "dengue",
-  commit        = "45830c1e76b9645aef7a011e4cf2f7d0fe6c02dd",
+  commit        = "d4e52b0f9a77bbec704c11b587040e094ba76f07",
   repository    = repository,
   level         = "state",
   target        = "forecast",
   on_duplicate  = "skip"
 )
 
+submit_mosqlimate_forecasts(
+  disease       = "A92.0",
+  disease_label = "chikungunya",
+  commit        = "d4e52b0f9a77bbec704c11b587040e094ba76f07",
+  repository    = repository,
+  level         = "state",
+  target        = "forecast",
+  on_duplicate  = "skip"
+)
+
+submit_mosqlimate_forecasts(
+  disease       = "A90",
+  disease_label = "dengue",
+  commit        = "d4e52b0f9a77bbec704c11b587040e094ba76f07",
+  repository    = repository,
+  level         = "city",
+  target        = "forecast",
+  on_duplicate  = "skip"
+)
+
+submit_mosqlimate_forecasts(
+  disease       = "A92.0",
+  disease_label = "chikungunya",
+  commit        = "d4e52b0f9a77bbec704c11b587040e094ba76f07",
+  repository    = repository,
+  level         = "city",
+  target        = "forecast",
+  on_duplicate  = "skip"
+)
