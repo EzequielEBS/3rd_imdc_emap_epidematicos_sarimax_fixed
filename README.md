@@ -1,6 +1,11 @@
 # 3rd Infodengue-Mosqlimate Dengue Challenge (IMDC) 2026 — State-level SARIMAX
 
-Submission repository for the **2026 3rd Infodengue-Mosqlimate Dengue Challenge**: state-level (UF) weekly probable-case forecasts for **dengue** and **chikungunya** in Brazil, produced with SARIMAX models fit per state.
+Submission repository for the **2026 3rd Infodengue-Mosqlimate Dengue Challenge**: state-level (UF) weekly probable-case forecasts for **dengue** and **chikungunya** in Brazil, produced with SARIMAX models fit independently per state (all 26 UFs, both diseases) and per focal city (15 dengue cities, 10 chikungunya cities — the Optional City-Level Challenges).
+
+**GitHub repository:** [EzequielEBS/3rd_imdc_emap_epidematicos_sarimax_fixed](https://github.com/EzequielEBS/3rd_imdc_emap_epidematicos_sarimax_fixed)
+
+**Related repositories:**
+- [EzequielEBS/3rd_imdc_emap_epidematicos_prophet_fixed](https://github.com/EzequielEBS/3rd_imdc_emap_epidematicos_prophet_fixed) — Prophet models
 
 ## 1. Team and Contributors
 
